@@ -32,7 +32,8 @@
         "@modelcontextprotocol/server-filesystem@2.0.0",
         "/Users/cemguler/dev_env/rust_workspace/rigagent/src",
         "/Users/cemguler/dev_env/rust_workspace/rigagent/docs",
-        "/Users/cemguler/dev_env/agent-workspace"
+        "/Users/cemguler/dev_env/agent-workspace",
+        "/Users/cemguler/dev_env/agent-skills"
       ],
       "env": {},
       "enabled": true
