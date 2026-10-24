@@ -399,9 +399,13 @@ impl AgentTask {
 /// applies to this turn and stays in the conversation afterwards, which is
 /// what lets a follow-up question refer back to the work it produced.
 fn skill_prompt(body: &str, request: &str) -> String {
+    // Saying the body is already here matters: the preamble tells the model to
+    // open a matching skill with read_skill, and without this it may spend a
+    // tool call re-fetching what it was just handed.
     let mut prompt = String::from(
-        "Follow the instructions in the skill below for this request.\n\n\
-         ----- skill -----\n",
+        "Follow the instructions in the skill below for this request. Its full \
+         text is included here, so there is no need to open it with \
+         read_skill.\n\n----- skill -----\n",
     );
     prompt.push_str(body.trim());
     prompt.push_str("\n----- end of skill -----\n\n");

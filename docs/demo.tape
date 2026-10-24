@@ -29,6 +29,11 @@ Sleep 600ms
 Enter
 Sleep 14s
 
+Type "/grilling my plan to rewrite the parser by hand"
+Sleep 600ms
+Enter
+Sleep 13s
+
 Type "/exit"
 Sleep 800ms
 Enter

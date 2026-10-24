@@ -173,9 +173,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Width reserved for the context gauge, enough for a double-width glyph
-/// plus `100%`.
-const GAUGE_WIDTH: u16 = 9;
+/// Width reserved for the context gauge: a double-width glyph, a space, the
+/// widest `used/limit` [`compact`] produces (`999k/999k`), and a trailing
+/// space.
+const GAUGE_WIDTH: u16 = 13;
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // The hints are clipped before the gauge is, so the gauge survives a
@@ -195,16 +196,27 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The context-usage gauge: a weather glyph for the fifth of the window in
-/// use, and the percentage itself.
+/// use, then the tokens used against the window they are measured in.
+///
+/// Tokens rather than a percentage because the windows models now ship with
+/// make the percentage useless: 5,000 tokens of a million is 0%, and stays
+/// 0% through a long conversation. The glyph carries the proportion; the
+/// numbers carry the scale.
 ///
 /// A dimmed placeholder stands in until a provider reports usage, so an
 /// unknown figure never reads as an empty context.
 fn context_gauge(app: &App) -> Line<'static> {
-    let Some(percent) = app.context_percent() else {
-        return Line::from(Span::styled("· --% ", Style::default().fg(Color::DarkGray)));
+    let limit = compact(app.context_limit);
+    let Some(used) = app.context_tokens else {
+        return Line::from(Span::styled(
+            format!("· --/{limit} "),
+            Style::default().fg(Color::DarkGray),
+        ));
     };
 
-    let weather = Weather::for_percent(percent);
+    // The glyph still comes from the proportion, which is what the five
+    // equal fifths describe.
+    let weather = Weather::for_percent(app.context_percent().unwrap_or(0));
     let color = match weather {
         Weather::Sunny => Color::Green,
         Weather::PartlyCloudy => Color::LightGreen,
@@ -213,9 +225,28 @@ fn context_gauge(app: &App) -> Line<'static> {
         Weather::Storm => Color::Red,
     };
     Line::from(Span::styled(
-        format!("{} {percent}% ", weather.icon()),
+        format!("{} {}/{limit} ", weather.icon(), compact(used)),
         Style::default().fg(color),
     ))
+}
+
+/// A token count in at most four characters: `812`, `45k`, `1.2M`.
+///
+/// Rounded down, so the gauge never claims more room is used than is.
+fn compact(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{}k", tokens / 1_000),
+        _ => {
+            let millions = tokens / 1_000_000;
+            let tenths = (tokens % 1_000_000) / 100_000;
+            if tenths == 0 {
+                format!("{millions}M")
+            } else {
+                format!("{millions}.{tenths}M")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -323,16 +354,16 @@ mod tests {
         assert_eq!(unknown.chars().count(), 80, "the row is exactly one screen");
         assert!(unknown.contains("Ctrl+C"), "the hints survive: {unknown:?}");
         assert!(
-            unknown.contains("--%"),
-            "usage is unknown up front: {unknown:?}"
+            unknown.contains("--/64k"),
+            "the window shows before the first reply: {unknown:?}"
         );
 
         // 32_000 of the helper's 64_000-token window is the middle fifth.
         app.apply_event(AgentEvent::ContextTokens(32_000));
         let overcast = footer_row(&mut app, 80);
         assert!(
-            overcast.contains("50%"),
-            "the figure is shown: {overcast:?}"
+            overcast.contains("32k/64k"),
+            "the counts are shown: {overcast:?}"
         );
         assert!(
             overcast.contains(Weather::Overcast.icon()),
@@ -341,6 +372,72 @@ mod tests {
         assert!(
             overcast.contains("Ctrl+C"),
             "the gauge does not push the hints off: {overcast:?}"
+        );
+    }
+
+    #[test]
+    fn a_small_fraction_of_a_large_window_still_reads() {
+        // The case that made a percentage useless: 5k of a million rounds to
+        // 0%, and stays there through a long conversation.
+        let mut app = App::new(
+            "deepseek:deepseek-flash".into(),
+            Vec::new(),
+            1_000_000,
+            Vec::new(),
+        );
+        app.apply_event(AgentEvent::ContextTokens(5_120));
+
+        assert_eq!(app.context_percent(), Some(0), "the percentage is 0");
+
+        let row = footer_row(&mut app, 80);
+        assert!(row.contains("5k/1M"), "the tokens are legible: {row:?}");
+        assert!(
+            row.contains(Weather::Sunny.icon()),
+            "the glyph still carries the proportion: {row:?}"
+        );
+    }
+
+    #[test]
+    fn counts_compact_to_four_characters() {
+        assert_eq!(compact(0), "0");
+        assert_eq!(compact(812), "812");
+        assert_eq!(compact(999), "999");
+        assert_eq!(compact(1_000), "1k");
+        assert_eq!(compact(5_120), "5k", "rounded down, never up");
+        assert_eq!(compact(64_000), "64k");
+        assert_eq!(compact(999_999), "999k");
+        assert_eq!(compact(1_000_000), "1M");
+        assert_eq!(compact(1_250_000), "1.2M");
+        assert_eq!(compact(128_000), "128k");
+    }
+
+    #[test]
+    fn the_widest_gauge_fits_its_reserved_width() {
+        let mut app = App::new("x:y".into(), Vec::new(), 999_999, Vec::new());
+        app.apply_event(AgentEvent::ContextTokens(999_999));
+        let rendered: String = context_gauge(&app)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            rendered.contains("999k/999k"),
+            "the worst case renders: {rendered:?}"
+        );
+        // A weather glyph may be double-width, so count it as two columns.
+        let width: u16 = rendered
+            .chars()
+            .map(|ch| {
+                if matches!(ch as u32, 0x1F300..=0x1F9FF | 0x26C0..=0x26FF) {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum();
+        assert!(
+            width <= GAUGE_WIDTH,
+            "the worst case must fit {GAUGE_WIDTH} columns, got {width}: {rendered:?}"
         );
     }
 

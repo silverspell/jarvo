@@ -307,8 +307,9 @@ control-modified characters.
 
 ## The context gauge
 
-The right-hand end of the footer shows how full the context window is, as a
-percentage and one of five weather glyphs covering an equal fifth each:
+The right-hand end of the footer shows how full the context window is: the
+tokens in use against the window they are measured in (`5k/1M`), and one of
+five weather glyphs covering an equal fifth each:
 
 | Glyph | Fill | Reading |
 | --- | --- | --- |
@@ -339,7 +340,13 @@ only the `submit` tool, so its request is much smaller than the chat agent's;
 reporting it would make the context look as though it had shrunk. The figure
 from the last ordinary turn stands until the next one.
 
-Two cases show `· --%` instead of a figure: before the first reply, and
+Tokens rather than a percentage, because the windows models now ship with
+make a percentage useless. 5,000 tokens of a million is 0%, and stays 0%
+through a long conversation. The glyph carries the proportion; the numbers
+carry the scale. Counts are rounded down to four characters at most, so the
+gauge never claims more room is used than is.
+
+Two cases show `· --/<window>` instead of a count: before the first reply, and
 whenever the provider reports no usage at all. Ollama commonly reports none.
 An unknown figure is never drawn as `0%`, because an unknown context and an
 empty one are not the same thing.
