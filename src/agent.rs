@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
+use crate::docs::{Docs, ReadSkill};
 use crate::mcp;
 use crate::providers;
 use crate::tools::GetCurrentTime;
@@ -72,6 +73,9 @@ pub enum AgentCommand {
     Prompt(String),
     /// Answer `prompt` as a JSON [`AnswerCard`].
     Structured(String),
+    /// Run the skill named `name`, with `request` as what the user wants from
+    /// it. The body is read by the agent task, which owns the library.
+    Skill { name: String, request: String },
     /// Forget the conversation so far.
     Reset,
 }
@@ -129,6 +133,8 @@ pub struct Started {
     pub handle: AgentHandle,
     pub events: mpsc::Receiver<AgentEvent>,
     pub notes: Vec<String>,
+    /// Skill names, so the interface can offer them as `/name`.
+    pub skills: Vec<String>,
 }
 
 /// Build the agent and spawn the task that owns it.
@@ -138,9 +144,25 @@ pub struct Started {
 pub async fn start(config: &Config) -> Result<Started> {
     let model = providers::build_model(config)?;
     let mcp_tools = mcp::load(config.mcp_config.as_deref().map(Path::new)).await;
-    let notes = mcp_tools.notes.clone();
+    let mut notes = mcp_tools.notes.clone();
     if mcp_tools.is_empty() {
         tracing::debug!("no MCP tools; running with native tools only");
+    }
+
+    let skills = Docs::load(config.skills_dir.as_deref());
+    notes.extend(skills.notes.iter().cloned());
+    if skills.is_empty() {
+        tracing::debug!("no skill library; running with the bare system prompt");
+    } else {
+        tracing::info!(skills = skills.len(), "skill library loaded");
+    }
+
+    // Only the catalogue goes into the preamble; bodies are opened on demand
+    // through read_skill, so a large library costs a few hundred tokens a turn
+    // instead of its full weight.
+    let mut preamble = config.system_prompt.clone();
+    if let Some(index) = skills.index() {
+        preamble.push_str(&index);
     }
 
     // `/json` goes through Rig's extractor, which offers the schema as a
@@ -155,8 +177,9 @@ pub async fn start(config: &Config) -> Result<Started> {
 
     let agent = AgentBuilder::new(model)
         .name("rigagent")
-        .preamble(&config.system_prompt)
+        .preamble(&preamble)
         .tool(GetCurrentTime)
+        .tool(ReadSkill::new(skills.clone()))
         .dynamic_tools(mcp_tools.tools)
         .build();
 
@@ -165,6 +188,7 @@ pub async fn start(config: &Config) -> Result<Started> {
 
     let task = AgentTask {
         agent,
+        skills: skills.clone(),
         extractor,
         history: Vec::new(),
         max_turns: config.max_turns,
@@ -180,12 +204,16 @@ pub async fn start(config: &Config) -> Result<Started> {
         },
         events: event_rx,
         notes,
+        skills: skills.ids(),
     })
 }
 
 /// The agent and the conversation it owns.
 struct AgentTask {
     agent: Agent,
+    /// The skill library, for `/name` invocations. The agent's `read_skill`
+    /// tool holds its own copy for the model's own lookups.
+    skills: Docs,
     extractor: Extractor<AnswerCard>,
     history: Vec<Message>,
     max_turns: usize,
@@ -221,6 +249,21 @@ impl AgentTask {
                         return;
                     }
                     let event = self.structured_turn(&prompt, &events).await;
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                AgentCommand::Skill { name, request } => {
+                    if events.send(AgentEvent::Started).await.is_err() {
+                        return;
+                    }
+                    let event = match self.skills.body(&name) {
+                        Ok(body) => {
+                            let prompt = skill_prompt(&body, &request);
+                            self.stream_turn(&prompt, &events).await
+                        }
+                        Err(err) => AgentEvent::Failed(err.to_string()),
+                    };
                     if events.send(event).await.is_err() {
                         return;
                     }
@@ -348,6 +391,27 @@ impl AgentTask {
             Err(err) => AgentEvent::Failed(err.to_string()),
         }
     }
+}
+
+/// The turn a `/skill` invocation sends.
+///
+/// The body goes in as the user's message rather than the preamble so it
+/// applies to this turn and stays in the conversation afterwards, which is
+/// what lets a follow-up question refer back to the work it produced.
+fn skill_prompt(body: &str, request: &str) -> String {
+    let mut prompt = String::from(
+        "Follow the instructions in the skill below for this request.\n\n\
+         ----- skill -----\n",
+    );
+    prompt.push_str(body.trim());
+    prompt.push_str("\n----- end of skill -----\n\n");
+    if request.is_empty() {
+        prompt.push_str("The user invoked this skill with no further request.");
+    } else {
+        prompt.push_str("The request: ");
+        prompt.push_str(request);
+    }
+    prompt
 }
 
 /// Tokens the run's last request carried: its prompt plus the reply it drew.

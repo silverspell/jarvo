@@ -33,7 +33,12 @@ pub async fn run(config: Config) -> Result<()> {
     let mut terminal = init()?;
     let result = event_loop(
         &mut terminal,
-        App::new(config.header_label(), started.notes, config.context_window),
+        App::new(
+            config.header_label(),
+            started.notes,
+            config.context_window,
+            started.skills,
+        ),
         started.handle,
         started.events,
     )
@@ -187,6 +192,17 @@ async fn handle_key(app: &mut App, key: KeyEvent, handle: &agent::AgentHandle) -
     Ok(())
 }
 
+/// The skill `text` invokes, if its first word names one.
+///
+/// Checked against the loaded library rather than a pattern, so an unknown
+/// `/command` still reaches the model as ordinary text instead of silently
+/// doing nothing.
+fn skill_command(text: &str, skills: &[String]) -> Option<String> {
+    let rest = text.strip_prefix('/')?;
+    let name = rest.split_whitespace().next()?;
+    skills.iter().find(|skill| skill.as_str() == name).cloned()
+}
+
 /// Send the input buffer to the agent, honouring the `/` commands.
 async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
     // Checked before the busy guard, and before the input is consumed, so a
@@ -216,6 +232,11 @@ async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
             "requesting a structured answer (not streamed)",
         );
         AgentCommand::Structured(prompt.to_string())
+    } else if let Some(name) = skill_command(&text, &app.skills) {
+        let request = text[1 + name.len()..].trim().to_string();
+        app.push(Role::User, text.clone());
+        app.push(Role::System, format!("running skill: {name}"));
+        AgentCommand::Skill { name, request }
     } else if text == "/clear" {
         app.entries.clear();
         app.status = Status::Idle;
@@ -236,7 +257,12 @@ mod tests {
     fn fixture() -> (App, agent::AgentHandle, mpsc::Receiver<AgentCommand>) {
         let (tx, rx) = mpsc::channel(4);
         (
-            App::new("deepseek:deepseek-chat".into(), Vec::new(), 64_000),
+            App::new(
+                "deepseek:deepseek-chat".into(),
+                Vec::new(),
+                64_000,
+                vec!["teach".to_string()],
+            ),
             agent::AgentHandle::with_sender(tx),
             rx,
         )
@@ -275,6 +301,49 @@ mod tests {
         assert!(
             !matches!(app.status, Status::Error(_)),
             "quitting is not the busy-guard error path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slash_command_naming_a_skill_runs_it() {
+        let (mut app, handle, mut rx) = fixture();
+        type_in(&mut app, "/teach me about borrow checking");
+
+        submit(&mut app, &handle).await.expect("submit should work");
+
+        match rx.try_recv() {
+            Ok(AgentCommand::Skill { name, request }) => {
+                assert_eq!(name, "teach");
+                assert_eq!(request, "me about borrow checking");
+            }
+            other => panic!("expected a skill command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_skill_may_be_invoked_with_no_request() {
+        let (mut app, handle, mut rx) = fixture();
+        type_in(&mut app, "/teach");
+
+        submit(&mut app, &handle).await.expect("submit should work");
+
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentCommand::Skill { name, request })
+                if name == "teach" && request.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_slash_command_is_sent_as_text() {
+        let (mut app, handle, mut rx) = fixture();
+        type_in(&mut app, "/nosuchskill do a thing");
+
+        submit(&mut app, &handle).await.expect("submit should work");
+
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentCommand::Prompt(text))
+                if text == "/nosuchskill do a thing"),
+            "an unknown command must not silently do nothing"
         );
     }
 

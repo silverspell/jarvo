@@ -119,6 +119,13 @@ pub struct Cli {
     #[arg(long, env = "RIGAGENT_CONTEXT_WINDOW")]
     pub context_window: Option<u64>,
 
+    /// Directory holding a skill library (`*/SKILL.md`).
+    ///
+    /// Each skill's name and description go into the preamble; bodies are
+    /// opened on demand with the read_skill tool.
+    #[arg(long, env = "RIGAGENT_SKILLS_DIR")]
+    pub skills_dir: Option<PathBuf>,
+
     /// Path to an optional MCP server configuration file.
     #[arg(long, env = "RIGAGENT_MCP_CONFIG")]
     pub mcp_config: Option<PathBuf>,
@@ -134,6 +141,8 @@ pub struct Config {
     /// Assumed context window, in tokens, for the footer's usage gauge.
     pub context_window: u64,
     pub mcp_config: Option<PathBuf>,
+    /// Directory holding the skill library, if one is configured.
+    pub skills_dir: Option<PathBuf>,
     /// The provider credential, if the chosen provider needs one.
     pub api_key: Option<String>,
     /// Base URL of the Ollama daemon (only meaningful for [`Provider::Ollama`]).
@@ -181,6 +190,7 @@ impl Config {
             max_turns: cli.max_turns.max(1),
             context_window,
             mcp_config: cli.mcp_config,
+            skills_dir: cli.skills_dir,
             api_key,
             ollama_base_url,
         })

@@ -5,6 +5,7 @@
 
 mod agent;
 mod config;
+mod docs;
 mod mcp;
 mod providers;
 mod tools;

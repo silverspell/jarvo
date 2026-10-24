@@ -72,6 +72,7 @@ Keep rendering and key handling off the model's path.
 | `src/providers.rs` | Provider clients, returns a `DynModel<Completion>` |
 | `src/agent.rs` | Agent task, streaming, history, structured output |
 | `src/tools.rs` | Native `#[rig_tool]` functions |
+| `src/docs.rs` | Markdown document store and the `read_skill` tool |
 | `src/mcp.rs` | Optional stdio MCP clients |
 | `src/tui/mod.rs` | Terminal lifecycle, input, event loop, slash commands |
 | `src/tui/app.rs` | State machine; no terminal, no network, so it is testable |
@@ -96,6 +97,27 @@ abstraction layer over Rig.
   both. Check that test before adding anything to the footer.
 - Quit commands are handled before the busy guard in `submit`, so they work
   mid-turn like `Ctrl+C`. That ordering is the feature.
+
+## Skills
+
+`src/docs.rs` loads `*/SKILL.md` from `--skills-dir`. Keep two properties:
+
+- **Only names and descriptions go into the preamble.** Bodies are opened
+  through `read_skill`. Putting bodies in the preamble is the obvious
+  "simplification" and it makes a thirty-skill library cost its full weight
+  every turn.
+- **`disable-model-invocation: true` keeps a skill out of the index**, not out
+  of the library: `/name` still reaches it. That is how a skill meant to be
+  triggered deliberately avoids starting by itself.
+
+The front-matter parser handles the subset of YAML that front matter uses, by
+design: a document it cannot read becomes a note, never an error, and never a
+guess. Reach for a YAML crate only if real documents need more.
+
+When the wiki arrives, it shares this module, but its content is **data, not
+instructions**. A skill body was vendored deliberately; a wiki page may have
+been written by the agent from a web page it browsed. Wrap the two
+differently when they reach the model.
 
 ## MCP
 

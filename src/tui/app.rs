@@ -123,11 +123,18 @@ pub struct App {
     /// The context window those tokens are measured against. An assumption
     /// from the provider or `--context-window`, not a reported limit.
     pub context_limit: u64,
+    /// Skill names, so `/name` can be told apart from an unknown command.
+    pub skills: Vec<String>,
 }
 
 impl App {
     /// A fresh interface for `header`, with `notes` shown as system entries.
-    pub fn new(header: String, notes: Vec<String>, context_limit: u64) -> Self {
+    pub fn new(
+        header: String,
+        notes: Vec<String>,
+        context_limit: u64,
+        skills: Vec<String>,
+    ) -> Self {
         let mut entries = vec![Entry {
             role: Role::System,
             text: "Enter sends · Alt+Enter (or Shift+Enter) for a newline · \
@@ -154,6 +161,7 @@ impl App {
             content_height: 0,
             context_tokens: None,
             context_limit: context_limit.max(1),
+            skills,
         }
     }
 
@@ -346,7 +354,7 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new("openai:gpt-4o-mini".into(), Vec::new(), 1_000)
+        App::new("openai:gpt-4o-mini".into(), Vec::new(), 1_000, Vec::new())
     }
 
     #[test]

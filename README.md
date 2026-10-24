@@ -58,6 +58,7 @@ With `RIGAGENT_PROVIDER` and `RIGAGENT_MODEL` set in `.env`, plain
 | `--system-prompt` | `RIGAGENT_SYSTEM_PROMPT` | built-in | System prompt for the agent |
 | `--max-turns` | `RIGAGENT_MAX_TURNS` | `500` | Model calls plus tool rounds per message |
 | `--context-window` | `RIGAGENT_CONTEXT_WINDOW` | per provider | Tokens assumed to fit, for the footer gauge only |
+| `--skills-dir` | `RIGAGENT_SKILLS_DIR` | none | Directory of `*/SKILL.md` documents |
 | `--mcp-config` | `RIGAGENT_MCP_CONFIG` | none | Path to an MCP server list |
 
 Default models are `gpt-4o-mini`, `deepseek-chat` and `llama3.2`.
@@ -73,6 +74,7 @@ Default models are `gpt-4o-mini`, `deepseek-chat` and `llama3.2`.
 | `RIGAGENT_LOG_FILE` | optional | File to write logs to; logging is off when unset |
 | `RIGAGENT_MAX_TURNS` | optional | Turn cap per message, default `500` |
 | `RIGAGENT_CONTEXT_WINDOW` | optional | Assumed context window in tokens, for the footer gauge |
+| `RIGAGENT_SKILLS_DIR` | optional | Directory holding the skill library |
 | `RUST_LOG` | optional | Log filter, e.g. `rigagent=debug` |
 
 Logging is file-only by design: the TUI owns the terminal, so anything printed
@@ -150,6 +152,52 @@ tools are not available inside it.
 The structured turn is recorded in the conversation as a plain user/assistant
 text pair rather than as the raw `submit` call, so a later message can refer
 back to the answer without the chat agent seeing a tool it does not have.
+
+## Skills
+
+A skill is a markdown file with front matter, holding instructions for one
+kind of work:
+
+```markdown
+---
+name: grilling
+description: Grill the user relentlessly about a plan. Use when they want to
+  stress-test their thinking.
+---
+
+The body, in markdown.
+```
+
+Point `--skills-dir` at a directory and every `*/SKILL.md` under it is loaded.
+Only each skill's **name and description** enter the preamble; bodies are
+opened on demand through the `read_skill` tool. A library of thirty skills
+therefore costs a few hundred tokens a turn rather than its full weight, and a
+skill that names another can have the model open that one too.
+
+Two ways in:
+
+- **The model opens one** when a description matches the work, through
+  `read_skill`.
+- **You invoke one** as `/name <request>`, for skills meant to be triggered
+  deliberately. Front matter's `disable-model-invocation: true` keeps a skill
+  out of the model's index while leaving `/name` working, so an interview or a
+  handoff never starts by itself.
+
+An unknown `/command` is sent to the model as ordinary text rather than
+silently doing nothing.
+
+Bodies are read when asked for, not at startup, so editing a skill takes
+effect on the next call instead of the next run.
+
+[mattpocock/skills](https://github.com/mattpocock/skills) works as-is, with
+one caveat worth knowing before you point at the whole collection: most of
+those skills are written for an agent that can read and write files and run
+tests. This application has a browser and a skill library and no filesystem
+tools, so a skill like `tdd` or `implement` will tell the model to do things
+it has no way to do. It reports that rather than pretending, but the skill is
+still useless. The conversational ones (`grilling`, `grill-me`, `teach`,
+`wait-what`, `to-questionnaire`, `writing-for-agents`, `codebase-design`,
+`handoff`) work today; the rest want the filesystem MCP server below.
 
 ## MCP (optional)
 

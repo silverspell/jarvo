@@ -226,7 +226,12 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn app() -> App {
-        App::new("ollama:llama3.2".into(), vec!["MCP: none".into()], 64_000)
+        App::new(
+            "ollama:llama3.2".into(),
+            vec!["MCP: none".into()],
+            64_000,
+            Vec::new(),
+        )
     }
 
     #[test]
