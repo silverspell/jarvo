@@ -249,13 +249,16 @@ impl App {
 
     // ---- transcript ----------------------------------------------------
 
-    /// Append an entry and, when following, scroll to it.
+    /// Append an entry.
+    ///
+    /// Follow mode is left alone: output arriving while the user is reading
+    /// further up must not yank the view back down. Only an explicit act —
+    /// sending a message, paging to the bottom, Ctrl+End — resumes following.
     pub fn push(&mut self, role: Role, text: impl Into<String>) {
         self.entries.push(Entry {
             role,
             text: text.into(),
         });
-        self.follow = true;
     }
 
     /// Append `delta` to the assistant entry in progress, starting one if the
@@ -268,7 +271,6 @@ impl App {
                 text: delta.to_string(),
             }),
         }
-        self.follow = true;
     }
 
     // ---- scrolling -----------------------------------------------------
@@ -280,19 +282,27 @@ impl App {
 
     /// Scroll up by one screenful, leaving follow mode.
     pub fn page_up(&mut self) {
-        let step = self.viewport_height.max(1);
-        self.scroll = self.scroll.saturating_sub(step);
+        self.scroll_up(self.viewport_height.max(1));
+    }
+
+    /// Scroll up by `lines`, leaving follow mode.
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_sub(lines);
         self.follow = false;
+    }
+
+    /// Scroll down by `lines`, re-entering follow mode at the bottom.
+    pub fn scroll_down(&mut self, lines: u16) {
+        let max = self.max_scroll();
+        self.scroll = self.scroll.saturating_add(lines).min(max);
+        if self.scroll >= max {
+            self.follow = true;
+        }
     }
 
     /// Scroll down by one screenful, re-entering follow mode at the bottom.
     pub fn page_down(&mut self) {
-        let step = self.viewport_height.max(1);
-        let max = self.max_scroll();
-        self.scroll = (self.scroll + step).min(max);
-        if self.scroll >= max {
-            self.follow = true;
-        }
+        self.scroll_down(self.viewport_height.max(1));
     }
 
     /// Jump to the newest output.
@@ -338,7 +348,6 @@ impl App {
                     _ if !text.is_empty() => self.push(Role::Assistant, text),
                     _ => {}
                 }
-                self.follow = true;
             }
             AgentEvent::Failed(message) => {
                 self.busy = false;
@@ -516,6 +525,61 @@ mod tests {
         app.page_down();
         assert_eq!(app.scroll, 15, "scrolling stops at the bottom");
         assert!(app.follow, "reaching the bottom resumes following");
+    }
+
+    #[test]
+    fn line_scrolling_clamps_at_both_ends() {
+        let mut app = app();
+        app.viewport_height = 10;
+        app.content_height = 25;
+
+        app.scroll_down(3);
+        assert_eq!(app.scroll, 3);
+        app.scroll_up(1);
+        assert_eq!(app.scroll, 2);
+        app.scroll_up(99);
+        assert_eq!(app.scroll, 0, "scrolling stops at the top");
+        assert!(!app.follow);
+
+        app.scroll_down(u16::MAX);
+        assert_eq!(app.scroll, 15, "scrolling stops at the bottom");
+        assert!(app.follow, "reaching the bottom resumes following");
+    }
+
+    #[test]
+    fn output_arriving_while_scrolled_back_leaves_the_view_alone() {
+        let mut app = app();
+        app.viewport_height = 10;
+        app.content_height = 50;
+        app.page_up();
+        assert!(!app.follow);
+        let resting = app.scroll;
+
+        // A whole turn's worth of events: tool calls, streamed text and the
+        // completion. None of it may drag the reader back down.
+        app.apply_event(AgentEvent::ToolCall {
+            name: "run_shell".into(),
+        });
+        app.apply_event(AgentEvent::Delta("a long answer".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "a long answer, finished".into(),
+        });
+
+        assert!(!app.follow, "the view stays where the reader put it");
+        assert_eq!(app.scroll, resting);
+    }
+
+    #[test]
+    fn sending_a_message_resumes_following() {
+        let mut app = app();
+        app.viewport_height = 10;
+        app.content_height = 50;
+        app.page_up();
+        assert!(!app.follow);
+
+        app.scroll_to_bottom();
+        assert!(app.follow);
+        assert_eq!(app.scroll, app.max_scroll());
     }
 
     #[test]

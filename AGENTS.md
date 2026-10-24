@@ -105,6 +105,14 @@ abstraction layer over Rig.
   both. Check that test before adding anything to the footer.
 - Quit commands are handled before the busy guard in `submit`, so they work
   mid-turn like `Ctrl+C`. That ordering is the feature.
+- `push` and `push_delta` deliberately leave `follow` alone. Setting it there
+  is the obvious-looking line, and it makes the transcript unscrollable while
+  anything is streaming: the next delta snaps the reader back down. Only an
+  explicit act resumes following — `scroll_to_bottom`, `scroll_down` reaching
+  the end, or `submit`.
+- Mouse capture is enabled so the wheel scrolls the transcript. It is the
+  reason click-drag selection needs a modifier, which the README states; do
+  not remove it without replacing the wheel binding.
 - `RunShell` is a manual `Tool` impl rather than `#[rig_tool]` because it
   carries state (the working directory). `ReadSkill` is the same shape, for
   the same reason.

@@ -166,7 +166,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     )];
     if !app.follow {
         spans.push(Span::styled(
-            "  [scrolled back — End to follow]",
+            "  [scrolled back — Ctrl+End to follow]",
             Style::default().fg(Color::DarkGray),
         ));
     }

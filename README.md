@@ -91,12 +91,21 @@ to stdout while it runs would corrupt the display.
 | `Shift+Enter` | Insert a newline (terminals that support keyboard enhancement) |
 | `←` `→` `Home` `End` | Move within the input |
 | `Backspace` / `Delete` | Edit the input |
-| `PageUp` / `PageDown` | Scroll the conversation |
+| `↑` / `↓` | Scroll the conversation a line at a time |
+| Mouse wheel | Scroll the conversation |
+| `PageUp` / `PageDown` | Scroll the conversation a screen at a time |
 | `Ctrl+End` | Jump back to the newest output |
 | `Ctrl+C` / `Ctrl+D` | Exit |
 
-Scrolling back pauses auto-follow; paging to the bottom (or `Ctrl+End`)
-resumes it.
+Scrolling back pauses auto-follow, and output arriving meanwhile does not
+disturb the view — a streaming answer or a run of tool calls will not drag you
+back down. Following resumes when you reach the bottom, press `Ctrl+End`, or
+send the next message.
+
+The application captures the mouse so the wheel reaches the transcript instead
+of the terminal's own scrollback. Click-drag selection therefore belongs to the
+application; hold `Option` (iTerm2, Terminal.app) or `Shift` (most others) to
+select text with the mouse as usual.
 
 ### Slash commands
 

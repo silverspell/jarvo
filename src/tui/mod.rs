@@ -9,8 +9,9 @@ pub mod ui;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui::DefaultTerminal;
@@ -23,6 +24,9 @@ use app::{App, Role, Status};
 /// Terminal-event channel depth. Key presses are drained every frame, so this
 /// only has to absorb a burst such as a paste.
 const INPUT_CAPACITY: usize = 128;
+
+/// Transcript lines one notch of the wheel moves.
+const WHEEL_LINES: u16 = 3;
 
 /// Start the agent, take over the terminal, and run until the user quits.
 ///
@@ -62,6 +66,12 @@ fn init() -> Result<DefaultTerminal> {
 
     let terminal = ratatui::try_init().context("failed to initialize the terminal")?;
 
+    // Without this the wheel reaches the terminal's own (empty) scrollback
+    // instead of the transcript. The cost is that a click-drag now belongs to
+    // the application: most terminals still select text when a modifier is
+    // held, Option in iTerm2 and Terminal.app, Shift elsewhere.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+
     if matches!(
         crossterm::terminal::supports_keyboard_enhancement(),
         Ok(true)
@@ -79,6 +89,7 @@ fn init() -> Result<DefaultTerminal> {
 
 /// Undo [`init`]. Safe to call more than once, and from a panic hook.
 fn restore() {
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     ratatui::restore();
 }
@@ -129,8 +140,10 @@ async fn event_loop(
                     // interface any more.
                     return Ok(());
                 };
-                if let Event::Key(key) = event {
-                    handle_key(&mut app, key, &handle).await?;
+                match event {
+                    Event::Key(key) => handle_key(&mut app, key, &handle).await?,
+                    Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
+                    _ => {}
                 }
             }
             event = events.recv() => {
@@ -184,12 +197,25 @@ async fn handle_key(app: &mut App, key: KeyEvent, handle: &agent::AgentHandle) -
         KeyCode::End => app.move_line_end(),
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
+        // The input buffer has no vertical cursor movement, so the arrows are
+        // free for the transcript, which is what a long answer needs.
+        KeyCode::Up => app.scroll_up(1),
+        KeyCode::Down => app.scroll_down(1),
 
         KeyCode::Char(ch) if !ctrl => app.insert_char(ch),
         _ => {}
     }
 
     Ok(())
+}
+
+/// Apply one mouse event. Only the wheel means anything here.
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_up(WHEEL_LINES),
+        MouseEventKind::ScrollDown => app.scroll_down(WHEEL_LINES),
+        _ => {}
+    }
 }
 
 /// The skill `text` invokes, if its first word names one.
@@ -219,6 +245,10 @@ async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
     let Some(text) = app.take_input() else {
         return Ok(());
     };
+
+    // Sending is deliberate, so it is one of the few things that resumes
+    // following after the user has scrolled back to read something.
+    app.scroll_to_bottom();
 
     let command = if let Some(rest) = text.strip_prefix("/json") {
         let prompt = rest.trim();
