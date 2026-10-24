@@ -317,9 +317,11 @@ impl AgentTask {
 
         match response {
             Ok(response) => {
-                if let Some(tokens) = context_tokens(&response.completion_calls) {
-                    let _ = events.send(AgentEvent::ContextTokens(tokens)).await;
-                }
+                // The gauge is deliberately not updated here. The extractor
+                // is a separate run carrying only the `submit` tool, so its
+                // request is far smaller than the chat agent's and reporting
+                // it would make the context look as though it had shrunk.
+                // The figure from the last chat turn stays until the next one.
                 if !response.output.confidence_in_range() {
                     let confidence = response.output.confidence;
                     tracing::warn!(confidence, "model reported confidence outside 0.0..=1.0");

@@ -15,6 +15,13 @@ A lightweight, keyboard-driven AI agent for the terminal, built on
 The crate, the binary and the `RIGAGENT_*` variables keep their original
 `rigagent` name; only the interface is branded Jarvo.
 
+![Jarvo answering a question with a tool call, then a structured answer](docs/demo.gif)
+
+A real session: `get_current_time` is called and returned (`→` / `←`), then
+`/json` produces an `AnswerCard`. The gauge at the right of the footer tracks
+how full the context window is. Regenerate the recording with
+`vhs docs/demo.tape` — it drives the real binary and makes real model calls.
+
 ## Requirements
 
 - A Rust toolchain supporting edition 2024. No MSRV is declared in
@@ -273,6 +280,11 @@ so the default is a per-provider guess (`openai` 128k, `deepseek` 64k, `ollama`
 8k) that is wrong for any model whose window differs. Set
 `--context-window` to the real figure for your model if the percentage
 matters to you.
+
+`/json` does not move the gauge. The extractor is a separate run carrying
+only the `submit` tool, so its request is much smaller than the chat agent's;
+reporting it would make the context look as though it had shrunk. The figure
+from the last ordinary turn stands until the next one.
 
 Two cases show `· --%` instead of a figure: before the first reply, and
 whenever the provider reports no usage at all. Ollama commonly reports none.
