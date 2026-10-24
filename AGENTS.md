@@ -43,6 +43,11 @@ Traps that have already cost time:
   explicitly rather than relying on the client's own environment lookup.
 - `PromptResponse.messages` already contains the prompt, so history grows by
   exactly one turn per run. Do not push the prompt again.
+- Clap's built-in `PathBuf` parser rejects an empty value, and a `.env` line
+  like `RIGAGENT_SHELL_DIR=` supplies exactly that, so the program refuses to
+  start. Every `PathBuf` option therefore uses `value_parser = any_path` and
+  decides blankness afterwards in `non_empty_path`. A `String` option is not
+  affected. Add a new path option the same way.
 
 ## Invariants
 

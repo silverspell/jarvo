@@ -123,18 +123,19 @@ pub struct Cli {
     ///
     /// Each skill's name and description go into the preamble; bodies are
     /// opened on demand with the read_skill tool.
-    #[arg(long, env = "RIGAGENT_SKILLS_DIR")]
+    #[arg(long, env = "RIGAGENT_SKILLS_DIR", value_parser = any_path)]
     pub skills_dir: Option<PathBuf>,
 
     /// Working directory for the run_shell tool.
     ///
-    /// Shell access is off unless this is set: the tool is only registered
-    /// when there is a directory to run commands in.
-    #[arg(long, env = "RIGAGENT_SHELL_DIR")]
+    /// Shell access is off unless this names an existing directory. Commands
+    /// then run without confirmation, with this process's permissions; the
+    /// directory is where they start, not a sandbox that contains them.
+    #[arg(long, env = "RIGAGENT_SHELL_DIR", value_parser = any_path)]
     pub shell_dir: Option<PathBuf>,
 
     /// Path to an optional MCP server configuration file.
-    #[arg(long, env = "RIGAGENT_MCP_CONFIG")]
+    #[arg(long, env = "RIGAGENT_MCP_CONFIG", value_parser = any_path)]
     pub mcp_config: Option<PathBuf>,
 }
 
@@ -198,9 +199,9 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
             max_turns: cli.max_turns.max(1),
             context_window,
-            mcp_config: cli.mcp_config,
-            skills_dir: cli.skills_dir,
-            shell_dir: cli.shell_dir,
+            mcp_config: non_empty_path(cli.mcp_config),
+            skills_dir: non_empty_path(cli.skills_dir),
+            shell_dir: non_empty_path(cli.shell_dir),
             api_key,
             ollama_base_url,
         })
@@ -241,9 +242,49 @@ fn require_key(name: &str, provider: Provider) -> Result<String> {
     }
 }
 
+/// Accept any string as a path, empty included.
+///
+/// Clap's own `PathBuf` parser rejects an empty value, and an environment
+/// variable that is present but blank — `RIGAGENT_SHELL_DIR=` on a line of a
+/// `.env` — is exactly that, so the program refuses to start instead of
+/// reading the variable as "off". Blankness is decided in [`non_empty_path`],
+/// after parsing.
+fn any_path(raw: &str) -> Result<PathBuf, std::convert::Infallible> {
+    Ok(PathBuf::from(raw))
+}
+
+/// Treat a blank path as absent.
+///
+/// Clap hands back `Some("")` for an environment variable that is present but
+/// empty, which `RIGAGENT_SHELL_DIR=` in a `.env` produces. That means "off",
+/// not a directory named "", exactly as a blank `--model` means "default".
+fn non_empty_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|path| !path.as_os_str().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn a_blank_shell_directory_means_off() {
+        let cli =
+            Cli::try_parse_from(["rigagent", "--shell-dir", ""]).expect("arguments should parse");
+        assert_eq!(
+            cli.shell_dir.as_deref(),
+            Some(Path::new("")),
+            "clap keeps the empty value"
+        );
+        assert_eq!(non_empty_path(cli.shell_dir), None);
+
+        let cli = Cli::try_parse_from(["rigagent", "--shell-dir", "/tmp"])
+            .expect("arguments should parse");
+        assert_eq!(
+            non_empty_path(cli.shell_dir).as_deref(),
+            Some(Path::new("/tmp"))
+        );
+    }
 
     #[test]
     fn provider_labels_match_cli_values() {
