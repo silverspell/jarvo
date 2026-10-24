@@ -258,7 +258,16 @@ fn read_doc(path: &Path) -> Result<Doc, String> {
     // Absent means invocable: a document says so only to opt out.
     let model_invocable = fields
         .get("disable-model-invocation")
-        .map(|value| !matches!(value.trim(), "true" | "yes"))
+        .map(|value| {
+            // Matched loosely and case-insensitively: this gate fails in the
+            // unsafe direction, so an unrecognised `True` would leave a
+            // document the user meant to trigger deliberately open to the
+            // model.
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on" | "1"
+            )
+        })
         .unwrap_or(true);
 
     Ok(Doc {
@@ -275,16 +284,36 @@ fn read_doc(path: &Path) -> Result<Doc, String> {
 /// uses: plain scalars, quoted scalars, and folded or literal block scalars.
 /// Anything else is skipped rather than guessed at, which is why a document
 /// without a usable `description` is reported instead of loaded.
+///
+/// Known edges of the subset, none of which real front matter has hit yet:
+/// a trailing `# comment` stays part of the value, because a description may
+/// legitimately contain `#`; an unbalanced quote is kept rather than
+/// rejected; a nested mapping is flattened into its parent's value; and `|`
+/// folds like `>` rather than preserving newlines. Reach for a YAML crate if
+/// a document ever needs one of these.
 fn parse_front_matter(contents: &str) -> Option<BTreeMap<String, String>> {
-    let body = contents.strip_prefix("---")?;
-    let body = body
-        .strip_prefix('\n')
-        .or_else(|| body.strip_prefix("\r\n"))?;
-    let end = body.find("\n---")?;
-    let header = &body[..end];
+    // The closing fence is a line that is exactly `---`, not any line that
+    // starts with it: a `----` rule, or a `---` inside a block scalar, must
+    // not end the header early and spill the rest of it into the body.
+    let mut all = contents.lines();
+    if all.next()?.trim_end() != "---" {
+        return None;
+    }
+    let mut header = Vec::new();
+    let mut closed = false;
+    for line in all {
+        if line.trim_end() == "---" {
+            closed = true;
+            break;
+        }
+        header.push(line);
+    }
+    if !closed {
+        return None;
+    }
 
     let mut fields = BTreeMap::new();
-    let mut lines = header.lines().peekable();
+    let mut lines = header.into_iter().peekable();
 
     while let Some(line) = lines.next() {
         if line.trim().is_empty() || line.starts_with('#') {
@@ -468,6 +497,54 @@ mod tests {
             fields.get("description").map(String::as_str),
             Some("Investigate a question.")
         );
+    }
+
+    #[test]
+    fn only_an_exact_fence_closes_the_header() {
+        // A `---` inside a block scalar, and a `----` rule, used to end the
+        // header early and spill the rest of it into the body.
+        let fields = parse_front_matter(
+            "---\nname: rules\ndescription: |\n  before\n  ---\n  after\n----\n---\nBody\n",
+        )
+        .expect("front matter");
+        assert_eq!(fields.get("name").map(String::as_str), Some("rules"));
+        assert_eq!(
+            fields.get("description").map(String::as_str),
+            Some("before --- after"),
+            "the fenced rule belongs to the value, not to the document"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_header_is_not_front_matter() {
+        assert!(parse_front_matter("---\nname: stray\nno closing fence\n").is_none());
+    }
+
+    #[test]
+    fn the_invocation_gate_fails_closed() {
+        let root = library(
+            "gate",
+            &[
+                (
+                    "shouty",
+                    "---\nname: shouty\ndescription: X.\ndisable-model-invocation: TRUE\n---\nB.\n",
+                ),
+                (
+                    "numeric",
+                    "---\nname: numeric\ndescription: X.\ndisable-model-invocation: 1\n---\nB.\n",
+                ),
+                ("open", "---\nname: open\ndescription: X.\n---\nB.\n"),
+            ],
+        );
+
+        let docs = Docs::load(Some(&root));
+        let index = docs.index().expect("one document is still invocable");
+        assert!(index.contains("- open:"), "{index}");
+        assert!(
+            !index.contains("- shouty:") && !index.contains("- numeric:"),
+            "an unrecognised truthy value must not leave a skill open: {index}"
+        );
+        assert_eq!(docs.len(), 3, "all three are still reachable as /name");
     }
 
     #[test]
