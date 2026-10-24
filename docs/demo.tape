@@ -29,10 +29,12 @@ Sleep 600ms
 Enter
 Sleep 14s
 
-Type "/grilling my plan to rewrite the parser by hand"
+# A subagent errand: the nested run_shell shows indented, and only the
+# report comes back into the conversation.
+Type "ask a subagent how many Rust files are in src/ and how many lines in total"
 Sleep 600ms
 Enter
-Sleep 13s
+Sleep 30s
 
 Type "/exit"
 Sleep 800ms

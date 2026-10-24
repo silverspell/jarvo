@@ -8,19 +8,24 @@ A lightweight, keyboard-driven AI agent for the terminal, built on
   or environment variable, never by editing source.
 - Streamed assistant responses rendered into a scrollable chat panel.
 - Conversation history kept for the life of the session.
-- One native Rust tool (`get_current_time`) plus optional MCP tools.
+- Four native Rust tools — `get_current_time`, `read_skill`, and, when you
+  turn them on, `run_shell` and `spawn_agent` — plus optional MCP tools.
+- A skill library of `*/SKILL.md` documents, indexed in the preamble and
+  opened on demand.
 - Structured JSON output deserialized into a Rust type (`/json`).
 - A footer gauge showing how full the context window is.
 
 The crate, the binary and the `RIGAGENT_*` variables keep their original
 `rigagent` name; only the interface is branded Jarvo.
 
-![Jarvo answering a question with a tool call, then a structured answer](docs/demo.gif)
+![Jarvo calling a tool, answering in JSON, then handing an errand to a subagent](docs/demo.gif)
 
-A real session: `get_current_time` is called and returned (`→` / `←`), then
-`/json` produces an `AnswerCard`. The gauge at the right of the footer tracks
-how full the context window is. Regenerate the recording with
-`vhs docs/demo.tape` — it drives the real binary and makes real model calls.
+A real session. `get_current_time` is called and returned (`→` / `←`); `/json`
+produces an `AnswerCard`; then a subagent counts the crate's source files, its
+nested `run_shell` calls showing indented under `↳` while only the report comes
+back into the conversation. The gauge at the right of the footer tracks how
+full the context window is. Regenerate the recording with `vhs docs/demo.tape`
+— it drives the real binary and makes real model calls.
 
 ## Requirements
 
@@ -418,6 +423,7 @@ src/
 ├── providers.rs   provider and model initialization
 ├── agent.rs       conversation, streaming, tools, structured output
 ├── tools.rs       native tool implementations
+├── docs.rs        skill library and the read_skill tool
 ├── mcp.rs         optional MCP client setup
 └── tui/
     ├── mod.rs     terminal lifecycle, input events, main loop
