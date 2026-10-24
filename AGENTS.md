@@ -119,8 +119,17 @@ abstraction layer over Rig.
   reason click-drag selection needs a modifier, which the README states; do
   not remove it without replacing the wheel binding.
 - `RunShell` is a manual `Tool` impl rather than `#[rig_tool]` because it
-  carries state (the working directory). `ReadSkill` is the same shape, for
-  the same reason.
+  carries state (the working directory). `ReadSkill` and `SpawnAgent` are the
+  same shape, for the same reason.
+- `SpawnAgent` holds an `Arc<OnceLock<Agent>>` that `agent::start` fills in
+  immediately after `AgentBuilder::build`. It looks like a deferred
+  initialization smell and it is the opposite: a subagent is the parent
+  cloned, so the tool cannot be handed the agent that owns it. The event
+  channel is created before the builder for the same reason. Do not try to
+  "fix" either by reordering; the cycle is real.
+- A subagent runs with `.preamble()` and no `.history()`. Both matter: the
+  empty history is the isolation that justifies the tool, and the preamble
+  carries the parent's skills index so the subagent can still read skills.
 - `RunShell::call` logs the full command line at `info` before spawning. That
   is deliberate: with no confirmation step, the log is the only record. It is
   not a leak — but it is why a command carrying a secret as an argument should

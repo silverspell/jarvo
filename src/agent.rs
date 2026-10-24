@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -22,7 +23,7 @@ use crate::config::Config;
 use crate::docs::{Docs, ReadSkill};
 use crate::mcp;
 use crate::providers;
-use crate::tools::{GetCurrentTime, RunShell};
+use crate::tools::{GetCurrentTime, RunShell, SpawnAgent};
 
 /// Capacity of both channels between the TUI and the agent task. Deltas arrive
 /// faster than frames are drawn, so the buffer is generous.
@@ -175,6 +176,10 @@ pub async fn start(config: &Config) -> Result<Started> {
         .retries(1)
         .build();
 
+    // Created before the agent, because the subagent tool reports nested
+    // activity through the same channel the task will later use.
+    let (event_tx, event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+
     let mut builder = AgentBuilder::new(model)
         .name("rigagent")
         .preamble(&preamble)
@@ -193,10 +198,20 @@ pub async fn start(config: &Config) -> Result<Started> {
         Err(note) => notes.push(note),
     }
 
+    // A subagent is this agent cloned, so the tool cannot be handed the agent
+    // it belongs to. The cell closes that circle immediately after `build`,
+    // and `SpawnAgent::call` is the only reader.
+    let agent_cell: Arc<OnceLock<Agent>> = Arc::new(OnceLock::new());
+    builder = builder.tool(SpawnAgent::new(
+        agent_cell.clone(),
+        preamble.clone(),
+        event_tx.clone(),
+    ));
+
     let agent = builder.build();
+    let _ = agent_cell.set(agent.clone());
 
     let (command_tx, command_rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let (event_tx, event_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
     let task = AgentTask {
         agent,

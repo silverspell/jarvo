@@ -124,6 +124,24 @@ and the transcript (`→ name` / `← name`).
 
 `read_skill` opens a skill body; see [Skills](#skills).
 
+### spawn_agent
+
+`spawn_agent` hands one self-contained task to a subagent and returns only its
+final report, plus the list of tools it called. The subagent is this agent
+cloned — same model, same tools, same skills — with an empty conversation and
+its own preamble.
+
+The isolation is the point. A code review that runs eight shell commands
+leaves eight command outputs in the conversation even though only the verdict
+matters; through a subagent the caller gets the verdict. The cost is that the
+subagent cannot see the conversation, so the task has to be stated completely,
+and it cannot come back with a question.
+
+It runs for at most 60 turns, below the parent's cap, because an agent that
+can start agents multiplies that budget. Nested tool calls appear in the
+transcript indented under `↳`, so a long errand is not a silent pause. A
+subagent may not start further subagents.
+
 ### run_shell
 
 `run_shell` runs a command line through `sh -c` and returns its exit code,
@@ -442,6 +460,10 @@ These are the honest edges of this implementation, not stubs:
   executes immediately. There is no allow-list and no prompt. `Ctrl+C` or
   `/exit` is the only interruption, and it ends the session. This matters most
   for `run_shell`, which is why it stays off until `--shell-dir` is given.
+- **A subagent has the parent's tools**, `run_shell` included, and nothing
+  confirms what it runs either. It is also one level deep by instruction, not
+  by construction: the preamble tells it not to start further subagents, and
+  the tool is in its set.
 - **`run_shell` is not sandboxed.** `--shell-dir` sets where commands start,
   nothing more. A command can read or write anything the account can, `.env`
   included, and the timeout and output caps bound the damage of a runaway

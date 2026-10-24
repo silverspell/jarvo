@@ -326,6 +326,30 @@ mod tests {
         assert!(output.stdout.contains("more bytes]"));
     }
 
+    #[tokio::test]
+    async fn a_subagent_without_its_agent_reports_rather_than_panics() {
+        // The cell is filled right after `AgentBuilder::build`. If that wiring
+        // is ever broken, the tool must say so instead of unwrapping.
+        let (events, _rx) = tokio::sync::mpsc::channel(4);
+        let tool = SpawnAgent::new(
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            "preamble".to_string(),
+            events,
+        );
+        let mut context = ToolContext::default();
+        let error = Tool::call(
+            &tool,
+            &mut context,
+            SpawnAgentArgs {
+                task: "anything".to_string(),
+                instructions: None,
+            },
+        )
+        .await
+        .expect_err("an unfilled cell cannot run a subagent");
+        assert!(matches!(error, SpawnAgentError::NotReady));
+    }
+
     #[test]
     fn clip_leaves_short_output_untouched() {
         let (text, cut) = clip(b"short");
@@ -342,5 +366,218 @@ mod tests {
         let kept = text.split('\n').next().expect("a first line");
         assert!(kept.chars().all(|c| c == '\u{00e7}'));
         assert!(kept.len() <= MAX_STREAM_BYTES);
+    }
+}
+
+/// Turn cap for one subagent run.
+///
+/// Lower than the parent's: a subagent is a bounded errand, and the caps
+/// multiply once an agent can start agents.
+const SUBAGENT_MAX_TURNS: usize = 60;
+
+/// Appended to the parent's preamble for a subagent run.
+///
+/// The subagent keeps the parent's tools and skills but reports once, in
+/// prose, because only its final message survives: the whole point is that
+/// the work it waded through stays out of the parent's conversation.
+const SUBAGENT_RULES: &str = "\n\nYou are a subagent. You were given one errand by another agent and \
+your reply is the only thing that returns to it: nothing you read, ran or \
+called is visible to the caller. Finish the errand yourself with the tools \
+you have, then answer with the findings and the facts the caller needs, \
+including anything that failed or that you could not do. Do not ask \
+questions, do not report progress, and do not start further subagents.";
+
+/// Arguments to [`SpawnAgent`].
+#[derive(Debug, Deserialize)]
+pub struct SpawnAgentArgs {
+    /// The errand, stated completely: the subagent sees none of this
+    /// conversation.
+    pub task: String,
+    /// Extra instructions for this run, such as what to report.
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+/// What [`SpawnAgent`] hands back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnAgentOutput {
+    /// The subagent's final message.
+    pub report: String,
+    /// Tools it called, in order, so the caller can judge what the report
+    /// rests on.
+    pub tools_used: Vec<String>,
+}
+
+/// Runs a task in a fresh conversation and returns only the final answer.
+///
+/// The subagent is this agent cloned: same model, same tools, same skills,
+/// but an empty history and its own preamble. That isolation is the feature —
+/// a job that reads twenty files reports a paragraph instead of leaving twenty
+/// files in the caller's context.
+#[derive(Clone)]
+pub struct SpawnAgent {
+    /// The parent agent, filled in after it is built.
+    ///
+    /// The tool belongs to the agent that owns it, so it cannot be handed the
+    /// agent at construction; `OnceLock` closes that circle exactly once.
+    agent: std::sync::Arc<std::sync::OnceLock<rig::Agent>>,
+    /// The parent's preamble, so a subagent inherits its skills index.
+    preamble: String,
+    /// Where nested activity is announced, so the interface is not blank
+    /// while a subagent works.
+    events: tokio::sync::mpsc::Sender<crate::agent::AgentEvent>,
+}
+
+impl SpawnAgent {
+    pub fn new(
+        agent: std::sync::Arc<std::sync::OnceLock<rig::Agent>>,
+        preamble: String,
+        events: tokio::sync::mpsc::Sender<crate::agent::AgentEvent>,
+    ) -> Self {
+        Self {
+            agent,
+            preamble,
+            events,
+        }
+    }
+}
+
+/// Why a subagent run produced no report.
+#[derive(Debug)]
+pub enum SpawnAgentError {
+    /// The agent was never published into the cell. A wiring mistake, not a
+    /// runtime condition.
+    NotReady,
+    /// The subagent's own run failed.
+    Run(String),
+}
+
+impl std::fmt::Display for SpawnAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReady => write!(f, "the agent is not available to clone"),
+            Self::Run(message) => write!(f, "the subagent failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SpawnAgentError {}
+
+impl rig::tool::Tool for SpawnAgent {
+    const NAME: &'static str = "spawn_agent";
+
+    type Args = SpawnAgentArgs;
+    type Output = SpawnAgentOutput;
+    type Error = SpawnAgentError;
+
+    fn description(&self) -> String {
+        format!(
+            "Hand one self-contained task to a subagent and get back only its \
+             final report. The subagent has the same model, tools and skills \
+             as you, but an empty conversation: it cannot see this one, so \
+             state the task completely, including any path, name or decision \
+             it needs. Use it when the work would otherwise fill this \
+             conversation with material you do not need to keep — searching a \
+             codebase, reading many files, a long tool sequence whose \
+             conclusion is what matters. Do not use it for work you can \
+             finish in a couple of calls, for anything needing the user's \
+             input, or to split a job whose parts depend on each other. It \
+             runs for at most {SUBAGENT_MAX_TURNS} turns."
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description":
+                        "The errand, stated completely. The subagent sees none of this conversation.",
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "Extra instructions for this run, such as what to report.",
+                },
+            },
+            "required": ["task"],
+        })
+    }
+
+    fn annotations(&self) -> rig::completion::ToolAnnotations {
+        rig::completion::ToolAnnotations {
+            title: Some("Run a subagent".to_string()),
+            // A subagent has the parent's tools, so it can do whatever the
+            // parent can, shell included.
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        }
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        use futures::StreamExt;
+        use rig::agent::MultiTurnStreamItem;
+
+        let agent = self.agent.get().ok_or(SpawnAgentError::NotReady)?;
+        tracing::info!(task = %args.task, "starting a subagent");
+
+        let mut preamble = format!("{}{SUBAGENT_RULES}", self.preamble);
+        if let Some(extra) = args.instructions.as_deref().map(str::trim)
+            && !extra.is_empty()
+        {
+            preamble.push_str("\n\n");
+            preamble.push_str(extra);
+        }
+
+        // No `.history()`: an empty conversation is the whole point.
+        let mut stream = agent
+            .prompt(args.task.clone())
+            .preamble(preamble)
+            .max_turns(SUBAGENT_MAX_TURNS)
+            .stream();
+
+        let mut tools_used = Vec::new();
+        let mut text = String::new();
+
+        while let Some(item) = stream.next().await {
+            let item = item.map_err(|err| SpawnAgentError::Run(err.to_string()))?;
+            match item {
+                MultiTurnStreamItem::StreamAssistantItem(rig::streaming::Item::Event(
+                    rig::streaming::StreamEvent::Text { text: delta, .. },
+                )) => text.push_str(&delta),
+                MultiTurnStreamItem::ToolCall { tool_call } => {
+                    let name = tool_call.function.name.to_string();
+                    // Indented, so a nested call reads as one: the interface
+                    // would otherwise sit silent for the whole errand.
+                    let _ = self
+                        .events
+                        .send(crate::agent::AgentEvent::Notice(format!("    ↳ {name}")))
+                        .await;
+                    tools_used.push(name);
+                }
+                MultiTurnStreamItem::ModelTurnRetried { .. } => {
+                    // The deltas so far were provisional. Keeping them would
+                    // splice an abandoned answer onto the real one.
+                    text.clear();
+                }
+                MultiTurnStreamItem::FinalResponse(response) => {
+                    let output = response.output();
+                    let report = if output.is_empty() { text } else { output };
+                    tracing::info!(tools = tools_used.len(), "subagent finished");
+                    return Ok(SpawnAgentOutput { report, tools_used });
+                }
+                _ => {}
+            }
+        }
+
+        Err(SpawnAgentError::Run(
+            "the subagent's stream ended without a response".into(),
+        ))
     }
 }
