@@ -1,0 +1,7 @@
+/target
+.env
+*.log
+.playwright-output/
+
+# CodeGraph local index
+.codegraph/

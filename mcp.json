@@ -1,0 +1,28 @@
+{
+  "servers": [
+    {
+      "name": "playwright",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@0.0.83",
+        "--isolated",
+        "--output-dir",
+        ".playwright-output"
+      ],
+      "env": {},
+      "enabled": true
+    },
+    {
+      "name": "pally",
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://agent.pally.com/mcp"
+      ],
+      "env": {},
+      "enabled": true
+    }
+  ]
+}

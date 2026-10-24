@@ -1,0 +1,244 @@
+//! CLI arguments and environment configuration.
+//!
+//! Provider selection is entirely data-driven: a `--provider`/`--model` pair on
+//! the command line, or the `RIGAGENT_PROVIDER`/`RIGAGENT_MODEL` environment
+//! variables. No Rust source needs editing to switch providers.
+//!
+//! API keys are read here and never logged.
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, ValueEnum};
+
+/// The default Ollama endpoint, used when `OLLAMA_BASE_URL` is unset.
+pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
+
+/// A supported model provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum Provider {
+    /// OpenAI, authenticated with `OPENAI_API_KEY`.
+    Openai,
+    /// DeepSeek, authenticated with `DEEPSEEK_API_KEY`.
+    Deepseek,
+    /// A local or remote Ollama daemon at `OLLAMA_BASE_URL`.
+    Ollama,
+}
+
+impl Provider {
+    /// The provider's display name, shown in the TUI header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Deepseek => "deepseek",
+            Self::Ollama => "ollama",
+        }
+    }
+
+    /// The model used when none is given on the command line.
+    fn default_model(self) -> &'static str {
+        match self {
+            Self::Openai => "gpt-4o-mini",
+            Self::Deepseek => "deepseek-chat",
+            Self::Ollama => "llama3.2",
+        }
+    }
+
+    /// A rough context window for the provider's usual models, in tokens.
+    ///
+    /// No provider reports its own limit, so this is an assumption used only
+    /// to turn a token count into the footer's percentage. It is wrong for any
+    /// model whose window differs from its provider's common one — override it
+    /// with `--context-window`.
+    fn default_context_window(self) -> u64 {
+        match self {
+            Self::Openai => 128_000,
+            Self::Deepseek => 64_000,
+            // Ollama serves whatever `num_ctx` the model file sets, commonly
+            // far below the architecture's maximum.
+            Self::Ollama => 8_192,
+        }
+    }
+}
+
+/// Command-line arguments.
+#[derive(Debug, Parser)]
+#[command(
+    name = "rigagent",
+    about = "A terminal AI agent built on Rig and Ratatui",
+    version
+)]
+pub struct Cli {
+    /// Model provider to talk to.
+    #[arg(short, long, value_enum, env = "RIGAGENT_PROVIDER")]
+    pub provider: Option<Provider>,
+
+    /// Model name, as the provider spells it.
+    #[arg(short, long, env = "RIGAGENT_MODEL")]
+    pub model: Option<String>,
+
+    /// System prompt handed to the agent.
+    #[arg(long, env = "RIGAGENT_SYSTEM_PROMPT")]
+    pub system_prompt: Option<String>,
+
+    /// Maximum agent turns per message (model calls plus tool rounds).
+    ///
+    /// Generous by default: a browsing task driven through MCP tools can take
+    /// dozens of rounds. It is a safety stop against a model looping forever,
+    /// not a budget.
+    #[arg(long, default_value_t = 500, env = "RIGAGENT_MAX_TURNS")]
+    pub max_turns: usize,
+
+    /// Path to an optional MCP server configuration file.
+    /// Context window assumed for the model, in tokens.
+    ///
+    /// Only drives the footer's usage gauge; it does not limit anything.
+    #[arg(long, env = "RIGAGENT_CONTEXT_WINDOW")]
+    pub context_window: Option<u64>,
+
+    #[arg(long, env = "RIGAGENT_MCP_CONFIG")]
+    pub mcp_config: Option<PathBuf>,
+}
+
+/// Fully resolved configuration: CLI arguments merged with the environment.
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub provider: Provider,
+    pub model: String,
+    pub system_prompt: String,
+    pub max_turns: usize,
+    /// Assumed context window, in tokens, for the footer's usage gauge.
+    pub context_window: u64,
+    pub mcp_config: Option<PathBuf>,
+    /// The provider credential, if the chosen provider needs one.
+    pub api_key: Option<String>,
+    /// Base URL of the Ollama daemon (only meaningful for [`Provider::Ollama`]).
+    pub ollama_base_url: String,
+}
+
+/// The default system prompt. Mentions the time tool so a tool-capable model
+/// reaches for it instead of guessing.
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant running inside a terminal UI. \
+Keep answers concise and use plain text. \
+When the user asks about the current date or time, call the get_current_time tool instead of guessing.";
+
+impl Config {
+    /// Resolve configuration from parsed arguments and the process environment.
+    ///
+    /// Call [`load_dotenv`] first so a `.env` file is visible here.
+    pub fn resolve(cli: Cli) -> Result<Self> {
+        let provider = cli.provider.unwrap_or(Provider::Openai);
+        let model = cli
+            .model
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| provider.default_model().to_string());
+
+        let api_key = match provider {
+            Provider::Openai => Some(require_key("OPENAI_API_KEY", provider)?),
+            Provider::Deepseek => Some(require_key("DEEPSEEK_API_KEY", provider)?),
+            // Ollama is normally unauthenticated; a token is honoured if present.
+            Provider::Ollama => non_empty_env("OLLAMA_API_KEY"),
+        };
+
+        let ollama_base_url =
+            non_empty_env("OLLAMA_BASE_URL").unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string());
+
+        Ok(Self {
+            provider,
+            model,
+            system_prompt: cli
+                .system_prompt
+                .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+            max_turns: cli.max_turns.max(1),
+            context_window: cli
+                .context_window
+                .filter(|window| *window > 0)
+                .unwrap_or_else(|| provider.default_context_window()),
+            mcp_config: cli.mcp_config,
+            api_key,
+            ollama_base_url,
+        })
+    }
+
+    /// `provider:model`, for the TUI header.
+    pub fn header_label(&self) -> String {
+        format!("{}:{}", self.provider.label(), self.model)
+    }
+}
+
+/// Load `.env` from the working directory, if one exists. A missing file is not
+/// an error; anything else is reported.
+pub fn load_dotenv() -> Result<()> {
+    match dotenvy::dotenv() {
+        Ok(_) => Ok(()),
+        Err(err) if err.not_found() => Ok(()),
+        Err(err) => Err(err).context("failed to read .env"),
+    }
+}
+
+/// An environment variable's value, treating blank as unset.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// A required credential. The error names the variable but never its value.
+fn require_key(name: &str, provider: Provider) -> Result<String> {
+    match non_empty_env(name) {
+        Some(key) => Ok(key),
+        None => bail!(
+            "provider `{}` needs {name}; set it in the environment or in a .env file",
+            provider.label()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_labels_match_cli_values() {
+        assert_eq!(Provider::Openai.label(), "openai");
+        assert_eq!(Provider::Deepseek.label(), "deepseek");
+        assert_eq!(Provider::Ollama.label(), "ollama");
+    }
+
+    #[test]
+    fn parses_provider_and_model_from_argv() {
+        let cli = Cli::try_parse_from([
+            "rigagent",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-chat",
+        ])
+        .expect("arguments should parse");
+        assert_eq!(cli.provider, Some(Provider::Deepseek));
+        assert_eq!(cli.model.as_deref(), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn each_provider_has_a_default_model() {
+        for provider in [Provider::Openai, Provider::Deepseek, Provider::Ollama] {
+            assert!(!provider.default_model().is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_provider() {
+        assert!(Cli::try_parse_from(["rigagent", "--provider", "nope"]).is_err());
+    }
+
+    #[test]
+    fn max_turns_defaults_high_and_is_overridable() {
+        let cli = Cli::try_parse_from(["rigagent"]).expect("bare arguments should parse");
+        assert_eq!(cli.max_turns, 500);
+
+        let cli = Cli::try_parse_from(["rigagent", "--max-turns", "3"]).expect("should parse");
+        assert_eq!(cli.max_turns, 3);
+    }
+}
