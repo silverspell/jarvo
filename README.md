@@ -17,7 +17,8 @@ The crate, the binary and the `RIGAGENT_*` variables keep their original
 
 ## Requirements
 
-- Rust 1.97.1 or newer (built and tested on 1.99.1).
+- A Rust toolchain supporting edition 2024. No MSRV is declared in
+  `Cargo.toml`; this is built and tested on stable 1.99.1 only.
 - For `--provider ollama`: a running Ollama daemon with the model pulled.
 
 ## Setup
@@ -183,9 +184,13 @@ The flags in `mcp.json` are deliberate:
 
 | Flag | Why |
 | --- | --- |
-| `--headless` | The TUI owns the terminal; a window opening mid-turn is intrusive |
 | `--isolated` | Browser profile stays in memory, never written to disk and never your real Chrome profile |
 | `--output-dir .playwright-output` | Screenshots land in one gitignored place instead of the repo root |
+
+The browser runs **headed**: a real window opens when the agent navigates.
+That is deliberate — watching the page is how you tell a stuck run from a slow
+one, and a browsing agent is worth watching. Add `--headless` to `mcp.json` if
+you would rather it stayed out of sight.
 
 The version is pinned (`@playwright/mcp@0.0.83`) so a new release cannot change
 the tool surface under you. Playwright MCP also restricts filesystem access to
