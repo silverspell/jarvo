@@ -30,10 +30,210 @@ pub fn get_current_time() -> Result<CurrentTime, ToolExecutionError> {
     })
 }
 
+/// How much of each output stream reaches the model, in bytes.
+///
+/// A command like `find /` would otherwise bury the conversation; the result
+/// says when it has been cut rather than trimming silently.
+const MAX_STREAM_BYTES: usize = 24_000;
+
+/// Default seconds a command may run before it is killed.
+const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+
+/// Ceiling on the timeout a caller may ask for.
+const MAX_TIMEOUT_SECONDS: u64 = 900;
+
+/// Arguments to [`RunShell`].
+#[derive(Debug, Deserialize)]
+pub struct RunShellArgs {
+    /// The command line, interpreted by `sh -c`.
+    pub command: String,
+    /// Seconds before the command is killed. Defaults to
+    /// [`DEFAULT_TIMEOUT_SECONDS`], capped at [`MAX_TIMEOUT_SECONDS`].
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// What [`RunShell`] hands back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellOutput {
+    /// The process exit code, or `None` if it was killed by a signal or the
+    /// timeout.
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    /// Set when either stream was cut at [`MAX_STREAM_BYTES`].
+    pub truncated: bool,
+    /// Set when the command was killed for running too long.
+    pub timed_out: bool,
+}
+
+/// Runs a shell command in a fixed working directory.
+///
+/// This is general shell access: whatever `sh -c` accepts, it runs, with the
+/// permissions of the process. There is no allow-list and no confirmation
+/// step, so the working directory is the only boundary, and even that only
+/// bounds where commands *start* — a command is free to name an absolute path
+/// elsewhere. It is off unless `--shell-dir` is given.
+#[derive(Debug, Clone)]
+pub struct RunShell {
+    dir: std::path::PathBuf,
+}
+
+impl RunShell {
+    pub fn new(dir: std::path::PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+/// What can go wrong before a command produces output.
+#[derive(Debug)]
+pub struct ShellSpawnError(std::io::Error);
+
+impl std::fmt::Display for ShellSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not start the command: {}", self.0)
+    }
+}
+
+impl std::error::Error for ShellSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl rig::tool::Tool for RunShell {
+    const NAME: &'static str = "run_shell";
+
+    type Args = RunShellArgs;
+    type Output = ShellOutput;
+    type Error = ShellSpawnError;
+
+    fn description(&self) -> String {
+        format!(
+            "Run a shell command with `sh -c` in {} and return its exit code, \
+             stdout and stderr. Use it for git, builds, tests and other CLI \
+             tools. Commands run without confirmation, so read before you \
+             delete or overwrite. Output over {MAX_STREAM_BYTES} bytes per \
+             stream is truncated, and a command is killed after \
+             {DEFAULT_TIMEOUT_SECONDS}s unless timeout_seconds says otherwise. \
+             There is no stdin: a command that waits for input will fail \
+             rather than hang.",
+            self.dir.display()
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The command line, interpreted by `sh -c`.",
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description":
+                        "Seconds before the command is killed. Defaults to 120, capped at 900.",
+                    "minimum": 1,
+                },
+            },
+            "required": ["command"],
+        })
+    }
+
+    fn annotations(&self) -> rig::completion::ToolAnnotations {
+        rig::completion::ToolAnnotations {
+            title: Some("Run shell command".to_string()),
+            // Everything else here is a hint to a host that enforces one.
+            // This application does not: the honest value is that a shell
+            // command may do anything at all.
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        }
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let seconds = args
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+            .clamp(1, MAX_TIMEOUT_SECONDS);
+
+        // Logged in full: with no confirmation step, the log is the only
+        // record of what the model actually ran.
+        tracing::info!(command = %args.command, dir = %self.dir.display(), "running shell command");
+
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&args.command)
+            .current_dir(&self.dir)
+            // No stdin, so anything that prompts fails instead of hanging.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // Dropping the future on timeout must take the process with it.
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(ShellSpawnError)?;
+
+        let duration = std::time::Duration::from_secs(seconds);
+        match tokio::time::timeout(duration, child.wait_with_output()).await {
+            Ok(Ok(output)) => {
+                let (stdout, out_cut) = clip(&output.stdout);
+                let (stderr, err_cut) = clip(&output.stderr);
+                tracing::info!(exit = ?output.status.code(), "shell command finished");
+                Ok(ShellOutput {
+                    exit_code: output.status.code(),
+                    stdout,
+                    stderr,
+                    truncated: out_cut || err_cut,
+                    timed_out: false,
+                })
+            }
+            Ok(Err(err)) => Err(ShellSpawnError(err)),
+            Err(_) => {
+                tracing::warn!(seconds, command = %args.command, "shell command timed out");
+                Ok(ShellOutput {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: format!("killed after {seconds}s"),
+                    truncated: false,
+                    timed_out: true,
+                })
+            }
+        }
+    }
+}
+
+/// Decode `bytes` as text, cut to [`MAX_STREAM_BYTES`] on a char boundary.
+///
+/// Returns the text and whether anything was dropped.
+fn clip(bytes: &[u8]) -> (String, bool) {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= MAX_STREAM_BYTES {
+        return (text.into_owned(), false);
+    }
+    let mut end = MAX_STREAM_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    (
+        format!("{}\n[... {dropped} more bytes]", &text[..end]),
+        true,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rig::serve::adapters::ToolAdapter;
+    use rig::tool::{Tool, ToolContext};
 
     #[tokio::test]
     async fn get_current_time_returns_a_parseable_utc_instant() {
@@ -50,5 +250,97 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(&time.utc).expect("utc field should be RFC 3339");
         assert_eq!(parsed.timestamp(), time.unix_seconds);
         assert!(time.unix_seconds > 1_700_000_000, "timestamp looks stale");
+    }
+
+    /// Runs the tool against a temporary directory, bypassing the agent.
+    async fn run(command: &str, timeout_seconds: Option<u64>) -> ShellOutput {
+        let dir = std::env::temp_dir();
+        let tool = RunShell::new(dir);
+        let mut context = ToolContext::default();
+        Tool::call(
+            &tool,
+            &mut context,
+            RunShellArgs {
+                command: command.to_string(),
+                timeout_seconds,
+            },
+        )
+        .await
+        .expect("the command should start")
+    }
+
+    #[tokio::test]
+    async fn run_shell_reports_stdout_and_a_zero_exit() {
+        let output = run("printf hello", None).await;
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "hello");
+        assert!(!output.truncated);
+        assert!(!output.timed_out);
+    }
+
+    #[tokio::test]
+    async fn run_shell_reports_a_failing_exit_code_rather_than_an_error() {
+        let output = run("echo oops >&2; exit 3", None).await;
+        assert_eq!(output.exit_code, Some(3));
+        assert_eq!(output.stderr.trim(), "oops");
+    }
+
+    #[tokio::test]
+    async fn run_shell_runs_in_the_configured_directory() {
+        let expected = std::env::temp_dir()
+            .canonicalize()
+            .expect("the temp dir should exist");
+        let output = run("pwd", None).await;
+        let actual = std::path::PathBuf::from(output.stdout.trim())
+            .canonicalize()
+            .expect("pwd should name a real directory");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn run_shell_kills_a_command_that_outlives_its_timeout() {
+        let output = run("sleep 30", Some(1)).await;
+        assert!(output.timed_out, "the command should have been killed");
+        assert_eq!(output.exit_code, None);
+        assert!(output.stderr.contains("killed after 1s"));
+    }
+
+    #[tokio::test]
+    async fn run_shell_gives_a_command_no_stdin_to_wait_on() {
+        // With stdin inherited this would hang the whole turn; with it closed
+        // `cat` sees EOF at once.
+        let output = run("cat", Some(10)).await;
+        assert!(!output.timed_out);
+        assert_eq!(output.stdout, "");
+    }
+
+    #[tokio::test]
+    async fn run_shell_caps_a_flood_of_output() {
+        let output = run("yes rigagent | head -c 200000", Some(30)).await;
+        assert!(output.truncated, "a 200 KB flood should be cut");
+        assert!(
+            output.stdout.len() < MAX_STREAM_BYTES + 64,
+            "the clipped text should stay near the cap, got {}",
+            output.stdout.len()
+        );
+        assert!(output.stdout.contains("more bytes]"));
+    }
+
+    #[test]
+    fn clip_leaves_short_output_untouched() {
+        let (text, cut) = clip(b"short");
+        assert_eq!(text, "short");
+        assert!(!cut);
+    }
+
+    #[test]
+    fn clip_cuts_on_a_char_boundary() {
+        // A multi-byte char straddling the cap must not be split in half.
+        let source = "\u{00e7}".repeat(MAX_STREAM_BYTES);
+        let (text, cut) = clip(source.as_bytes());
+        assert!(cut);
+        let kept = text.split('\n').next().expect("a first line");
+        assert!(kept.chars().all(|c| c == '\u{00e7}'));
+        assert!(kept.len() <= MAX_STREAM_BYTES);
     }
 }

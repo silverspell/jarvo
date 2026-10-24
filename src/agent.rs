@@ -5,7 +5,7 @@
 //! model and the model never touches the terminal.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::docs::{Docs, ReadSkill};
 use crate::mcp;
 use crate::providers;
-use crate::tools::GetCurrentTime;
+use crate::tools::{GetCurrentTime, RunShell};
 
 /// Capacity of both channels between the TUI and the agent task. Deltas arrive
 /// faster than frames are drawn, so the buffer is generous.
@@ -175,13 +175,25 @@ pub async fn start(config: &Config) -> Result<Started> {
         .retries(1)
         .build();
 
-    let agent = AgentBuilder::new(model)
+    let mut builder = AgentBuilder::new(model)
         .name("rigagent")
         .preamble(&preamble)
         .tool(GetCurrentTime)
         .tool(ReadSkill::new(skills.clone()))
-        .dynamic_tools(mcp_tools.tools)
-        .build();
+        .dynamic_tools(mcp_tools.tools);
+
+    // Shell access is opt-in and announced, because nothing confirms a
+    // command before it runs.
+    match shell_dir(config.shell_dir.as_deref()) {
+        Ok(Some(dir)) => {
+            notes.push(format!("Shell: commands run in {}", dir.display()));
+            builder = builder.tool(RunShell::new(dir));
+        }
+        Ok(None) => tracing::debug!("no shell directory; run_shell not registered"),
+        Err(note) => notes.push(note),
+    }
+
+    let agent = builder.build();
 
     let (command_tx, command_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -427,6 +439,30 @@ fn context_tokens(calls: &[CompletionCall]) -> Option<u64> {
     let usage = calls.last()?.usage;
     let input = usage.input_tokens?;
     Some(input + usage.output_tokens.unwrap_or(0))
+}
+
+/// Resolve the shell working directory, if shell access is configured.
+///
+/// `Ok(None)` means no shell was asked for. An `Err` carries a note for the
+/// conversation: a bad path leaves the agent running without the tool rather
+/// than failing to start, like the rest of the optional machinery here.
+fn shell_dir(configured: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let Some(dir) = configured else {
+        return Ok(None);
+    };
+    // Canonicalised so the tool description and the log name one real path,
+    // not whatever relative spelling reached the configuration.
+    match dir.canonicalize() {
+        Ok(path) if path.is_dir() => Ok(Some(path)),
+        Ok(path) => Err(format!(
+            "Shell: {} is not a directory, so run_shell is off",
+            path.display()
+        )),
+        Err(err) => Err(format!(
+            "Shell: cannot use {} ({err}), so run_shell is off",
+            dir.display()
+        )),
+    }
 }
 
 #[cfg(test)]

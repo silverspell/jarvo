@@ -126,6 +126,13 @@ pub struct Cli {
     #[arg(long, env = "RIGAGENT_SKILLS_DIR")]
     pub skills_dir: Option<PathBuf>,
 
+    /// Working directory for the run_shell tool.
+    ///
+    /// Shell access is off unless this is set: the tool is only registered
+    /// when there is a directory to run commands in.
+    #[arg(long, env = "RIGAGENT_SHELL_DIR")]
+    pub shell_dir: Option<PathBuf>,
+
     /// Path to an optional MCP server configuration file.
     #[arg(long, env = "RIGAGENT_MCP_CONFIG")]
     pub mcp_config: Option<PathBuf>,
@@ -143,6 +150,8 @@ pub struct Config {
     pub mcp_config: Option<PathBuf>,
     /// Directory holding the skill library, if one is configured.
     pub skills_dir: Option<PathBuf>,
+    /// Working directory for shell commands. `None` disables the tool.
+    pub shell_dir: Option<PathBuf>,
     /// The provider credential, if the chosen provider needs one.
     pub api_key: Option<String>,
     /// Base URL of the Ollama daemon (only meaningful for [`Provider::Ollama`]).
@@ -191,6 +200,7 @@ impl Config {
             context_window,
             mcp_config: cli.mcp_config,
             skills_dir: cli.skills_dir,
+            shell_dir: cli.shell_dir,
             api_key,
             ollama_base_url,
         })

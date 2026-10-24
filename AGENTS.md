@@ -59,6 +59,14 @@ No placeholder responses, no simulated tool calls.
 `RIGAGENT_LOG_FILE`. A child process inherits stderr by default, which is why
 `src/mcp.rs` pipes an MCP server's stderr into `tracing` instead.
 
+**Shell access stays opt-in.** `run_shell` is only registered when
+`--shell-dir` resolves to a real directory, and the conversation says so in a
+note. Do not register it unconditionally and do not default the directory: it
+runs arbitrary commands with no confirmation, so the person's decision to turn
+it on is the whole safety mechanism. Its guards — no stdin, `kill_on_drop` plus
+a timeout, and a byte cap per stream — bound a *runaway* command; nothing bounds
+a deliberate one, and the directory is where commands start, not a sandbox.
+
 **The interface never blocks on the model.** The agent runs in its own Tokio
 task; two `mpsc` channels connect them (`AgentCommand` out, `AgentEvent` in).
 Keep rendering and key handling off the model's path.
@@ -71,7 +79,7 @@ Keep rendering and key handling off the model's path.
 | `src/config.rs` | Clap arguments merged with the environment |
 | `src/providers.rs` | Provider clients, returns a `DynModel<Completion>` |
 | `src/agent.rs` | Agent task, streaming, history, structured output |
-| `src/tools.rs` | Native `#[rig_tool]` functions |
+| `src/tools.rs` | Native tools: `#[rig_tool]` functions and `run_shell` |
 | `src/docs.rs` | Markdown document store and the `read_skill` tool |
 | `src/mcp.rs` | Optional stdio MCP clients |
 | `src/tui/mod.rs` | Terminal lifecycle, input, event loop, slash commands |
@@ -97,6 +105,16 @@ abstraction layer over Rig.
   both. Check that test before adding anything to the footer.
 - Quit commands are handled before the busy guard in `submit`, so they work
   mid-turn like `Ctrl+C`. That ordering is the feature.
+- `RunShell` is a manual `Tool` impl rather than `#[rig_tool]` because it
+  carries state (the working directory). `ReadSkill` is the same shape, for
+  the same reason.
+- `RunShell::call` logs the full command line at `info` before spawning. That
+  is deliberate: with no confirmation step, the log is the only record. It is
+  not a leak — but it is why a command carrying a secret as an argument should
+  not be written that way.
+- `run_shell`'s annotations claim it is destructive and not read-only. Rig
+  passes annotations through as hints; nothing here enforces them. They are
+  honest about what the tool can do, not a constraint on it.
 
 ## Skills
 

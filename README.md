@@ -59,6 +59,7 @@ With `RIGAGENT_PROVIDER` and `RIGAGENT_MODEL` set in `.env`, plain
 | `--max-turns` | `RIGAGENT_MAX_TURNS` | `500` | Model calls plus tool rounds per message |
 | `--context-window` | `RIGAGENT_CONTEXT_WINDOW` | per provider | Tokens assumed to fit, for the footer gauge only |
 | `--skills-dir` | `RIGAGENT_SKILLS_DIR` | none | Directory of `*/SKILL.md` documents |
+| `--shell-dir` | `RIGAGENT_SHELL_DIR` | none | Working directory for `run_shell`; unset disables the tool |
 | `--mcp-config` | `RIGAGENT_MCP_CONFIG` | none | Path to an MCP server list |
 
 Default models are `gpt-4o-mini`, `deepseek-chat` and `llama3.2`.
@@ -75,6 +76,7 @@ Default models are `gpt-4o-mini`, `deepseek-chat` and `llama3.2`.
 | `RIGAGENT_MAX_TURNS` | optional | Turn cap per message, default `500` |
 | `RIGAGENT_CONTEXT_WINDOW` | optional | Assumed context window in tokens, for the footer gauge |
 | `RIGAGENT_SKILLS_DIR` | optional | Directory holding the skill library |
+| `RIGAGENT_SHELL_DIR` | optional | Working directory for `run_shell`; unset means no shell tool |
 | `RUST_LOG` | optional | Log filter, e.g. `rigagent=debug` |
 
 Logging is file-only by design: the TUI owns the terminal, so anything printed
@@ -110,6 +112,35 @@ resumes it.
 `{ "utc": "...", "unix_seconds": ... }`. A tool-capable model calls it when
 asked about the date or time; tool calls and returns appear in the status area
 and the transcript (`→ name` / `← name`).
+
+`read_skill` opens a skill body; see [Skills](#skills).
+
+### run_shell
+
+`run_shell` runs a command line through `sh -c` and returns its exit code,
+stdout and stderr. It exists because several skills are built on command-line
+tools — `cargo test` for test-first work, `git diff` for a review — and a model
+that cannot run them can only guess.
+
+It is **off unless `--shell-dir` is set**, and when it is on the conversation
+opens with a note saying which directory commands run in. Within those bounds:
+
+- No confirmation. A command runs the moment the model calls it, with this
+  process's permissions. The working directory is where commands *start*, not
+  a sandbox — a command is free to name an absolute path anywhere, so a shell
+  directory is as much access as the account has.
+- Every command is logged through `tracing` before it runs. With
+  `RIGAGENT_LOG_FILE` set, that log is the record of what was run; without it,
+  there is none.
+- No stdin. A command that waits for input sees EOF and fails instead of
+  hanging the turn.
+- Killed after 120 seconds by default, or `timeout_seconds` if the model asks,
+  capped at 900.
+- Each stream is cut at 24 KB, with `truncated: true` and a byte count, so a
+  runaway command cannot flood the context.
+
+Keep it pointed at a directory whose contents are in version control; the git
+history is the only undo.
 
 Add a tool by writing a function in `src/tools.rs` and registering it in
 `src/agent.rs`:
@@ -400,7 +431,12 @@ These are the honest edges of this implementation, not stubs:
   also keeps OAuth out of this codebase.
 - **No tool run is confirmed.** Every tool the model calls, native or MCP,
   executes immediately. There is no allow-list and no prompt. `Ctrl+C` or
-  `/exit` is the only interruption, and it ends the session.
+  `/exit` is the only interruption, and it ends the session. This matters most
+  for `run_shell`, which is why it stays off until `--shell-dir` is given.
+- **`run_shell` is not sandboxed.** `--shell-dir` sets where commands start,
+  nothing more. A command can read or write anything the account can, `.env`
+  included, and the timeout and output caps bound the damage of a runaway
+  command, not of a deliberate one.
 - **History is per-session.** Nothing is persisted; there is no vector store,
   retrieval or long-term memory.
 - `Paragraph::line_count`, used to measure the wrapped transcript for
