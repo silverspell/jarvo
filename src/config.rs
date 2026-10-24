@@ -45,13 +45,13 @@ impl Provider {
         }
     }
 
-    /// A rough context window for the provider's usual models, in tokens.
+    /// A conservative context window for the provider, used only when the
+    /// model is not in [`KNOWN_CONTEXT_WINDOWS`].
     ///
-    /// No provider reports its own limit, so this is an assumption used only
-    /// to turn a token count into the footer's percentage. It is wrong for any
-    /// model whose window differs from its provider's common one — override it
-    /// with `--context-window`.
-    fn default_context_window(self) -> u64 {
+    /// Windows vary by model, not by provider, so this is a floor rather than
+    /// a guess at the truth: better to show a fuller gauge than to imply room
+    /// that is not there.
+    fn fallback_context_window(self) -> u64 {
         match self {
             Self::Openai => 128_000,
             Self::Deepseek => 64_000,
@@ -60,6 +60,29 @@ impl Provider {
             Self::Ollama => 8_192,
         }
     }
+}
+
+/// Context windows, in tokens, for models this project has been run against.
+///
+/// Matched as prefixes so a dated variant resolves to its base model, longest
+/// first because `gpt-4o` is a prefix of `gpt-4o-mini`. No provider reports
+/// its own limit, so this table is maintained by hand and will fall behind;
+/// `--context-window` overrides it for anything missing or wrong.
+const KNOWN_CONTEXT_WINDOWS: &[(&str, u64)] = &[
+    ("deepseek-reasoner", 64_000),
+    ("deepseek-flash", 1_000_000),
+    ("deepseek-chat", 64_000),
+    ("gpt-4o-mini", 128_000),
+    ("gpt-4o", 128_000),
+];
+
+/// The context window assumed for `model`, falling back to the provider's.
+fn context_window_for(provider: Provider, model: &str) -> u64 {
+    KNOWN_CONTEXT_WINDOWS
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|(_, window)| *window)
+        .unwrap_or_else(|| provider.fallback_context_window())
 }
 
 /// Command-line arguments.
@@ -90,13 +113,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 500, env = "RIGAGENT_MAX_TURNS")]
     pub max_turns: usize,
 
-    /// Path to an optional MCP server configuration file.
     /// Context window assumed for the model, in tokens.
     ///
     /// Only drives the footer's usage gauge; it does not limit anything.
     #[arg(long, env = "RIGAGENT_CONTEXT_WINDOW")]
     pub context_window: Option<u64>,
 
+    /// Path to an optional MCP server configuration file.
     #[arg(long, env = "RIGAGENT_MCP_CONFIG")]
     pub mcp_config: Option<PathBuf>,
 }
@@ -144,6 +167,11 @@ impl Config {
         let ollama_base_url =
             non_empty_env("OLLAMA_BASE_URL").unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string());
 
+        let context_window = cli
+            .context_window
+            .filter(|window| *window > 0)
+            .unwrap_or_else(|| context_window_for(provider, &model));
+
         Ok(Self {
             provider,
             model,
@@ -151,10 +179,7 @@ impl Config {
                 .system_prompt
                 .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
             max_turns: cli.max_turns.max(1),
-            context_window: cli
-                .context_window
-                .filter(|window| *window > 0)
-                .unwrap_or_else(|| provider.default_context_window()),
+            context_window,
             mcp_config: cli.mcp_config,
             api_key,
             ollama_base_url,
@@ -231,6 +256,38 @@ mod tests {
     #[test]
     fn rejects_unknown_provider() {
         assert!(Cli::try_parse_from(["rigagent", "--provider", "nope"]).is_err());
+    }
+
+    #[test]
+    fn the_context_window_follows_the_model_not_the_provider() {
+        // The headline case: deepseek-flash is a 1M-token model, while the
+        // provider's other models are 64k. A provider-wide default got this
+        // wrong by a factor of sixteen.
+        assert_eq!(
+            context_window_for(Provider::Deepseek, "deepseek-flash"),
+            1_000_000
+        );
+        assert_eq!(
+            context_window_for(Provider::Deepseek, "deepseek-chat"),
+            64_000
+        );
+
+        // Longest prefix wins, so gpt-4o does not swallow gpt-4o-mini.
+        assert_eq!(context_window_for(Provider::Openai, "gpt-4o-mini"), 128_000);
+        assert_eq!(context_window_for(Provider::Openai, "gpt-4o"), 128_000);
+
+        // A dated variant resolves to its base model.
+        assert_eq!(
+            context_window_for(Provider::Deepseek, "deepseek-flash-2026-10"),
+            1_000_000
+        );
+
+        // Anything unknown falls back to the provider's floor.
+        assert_eq!(context_window_for(Provider::Ollama, "llama3.2"), 8_192);
+        assert_eq!(
+            context_window_for(Provider::Deepseek, "deepseek-something-new"),
+            64_000
+        );
     }
 
     #[test]

@@ -276,10 +276,15 @@ turn starts from. Tool definitions count toward it, so a session with MCP
 servers attached starts well above zero before you type anything.
 
 The denominator is an assumption. No provider reports its own context window,
-so the default is a per-provider guess (`openai` 128k, `deepseek` 64k, `ollama`
-8k) that is wrong for any model whose window differs. Set
-`--context-window` to the real figure for your model if the percentage
-matters to you.
+so `src/config.rs` keeps a small table of models it has been run against
+(`deepseek-flash` 1M, `deepseek-chat` 64k, `gpt-4o`/`gpt-4o-mini` 128k),
+matched as a prefix so dated variants resolve to their base model. A model
+outside the table falls back to a conservative per-provider floor (`openai`
+128k, `deepseek` 64k, `ollama` 8k), which understates a large window rather
+than inventing room that is not there.
+
+Windows belong to models, not providers, and the table is maintained by hand,
+so it will fall behind. `--context-window` overrides it.
 
 `/json` does not move the gauge. The extractor is a separate run carrying
 only the `submit` tool, so its request is much smaller than the chat agent's;
