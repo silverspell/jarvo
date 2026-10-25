@@ -75,16 +75,36 @@ function takeToken() {
   }
 }
 
+/**
+ * Three non-empty base64url parts. A link copied out of a split terminal can
+ * pick up a pane divider, and one stray character makes the token undecodable
+ * long before the server reads it; saying so beats a handshake that fails.
+ */
+function looksLikeToken(token) {
+  return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token);
+}
+
 function connect() {
   const token = takeToken();
   if (!token) {
     showBanner('No token. Open the link Jarvo printed, which ends with ?token=…');
     return;
   }
+  if (!looksLikeToken(token)) {
+    showBanner('That link’s token is damaged. Copy the whole link Jarvo printed and open it again.');
+    return;
+  }
 
   const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const url = `${scheme}://${window.location.host}/ws/browser?token=${encodeURIComponent(token)}`;
+  // A socket that never opened was refused; one that opened and closed is a
+  // room that went away. Only the second is worth reloading for.
+  let opened = false;
   socket = new WebSocket(url);
+
+  socket.addEventListener('open', () => {
+    opened = true;
+  });
 
   socket.addEventListener('message', (event) => {
     let message;
@@ -96,11 +116,19 @@ function connect() {
     handle(message);
   });
   socket.addEventListener('close', () => {
-    showBanner('The office connection closed. Reload the page to reconnect.');
+    showBanner(
+      opened
+        ? 'The office connection closed. Reload the page to reconnect.'
+        : 'The office refused this link. Its token is expired or not this office’s; open the newest link Jarvo printed. Reloading will not help.'
+    );
     setComposerEnabled(false);
   });
   socket.addEventListener('error', () => {
-    showBanner('The office connection failed. Reload the page to try again.');
+    // A refused handshake fires `error` and then `close`; let `close` speak,
+    // so the page never blames the network for a rejected token.
+    if (opened) {
+      showBanner('The office connection failed. Reload the page to try again.');
+    }
   });
 }
 
