@@ -14,6 +14,8 @@ pub fn tmux_command(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> Vec<Strin
         format!("jarvo-{}", session_name(name)),
         "-c".into(),
         cwd.to_string_lossy().into_owned(),
+        "/usr/bin/env".into(),
+        "RIGAGENT_SHELL_DIR=".into(),
         exe.to_string_lossy().into_owned(),
         "--office-dir".into(),
         dir.to_string_lossy().into_owned(),
@@ -22,21 +24,11 @@ pub fn tmux_command(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> Vec<Strin
     ]
 }
 
-/// The tmux invocation for a spawned Jarvo, with the shell door closed.
-fn spawn_command(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> Command {
-    let argv = tmux_command(exe, dir, cwd, name);
-    let mut command = Command::new(&argv[0]);
-    command.args(&argv[1..]);
-    // dotenvy never overrides an already-set variable, so a blank value here
-    // beats both an inherited setting and any `.env` in the room-chosen cwd.
-    command.env("RIGAGENT_SHELL_DIR", "");
-    command
-}
-
 /// Run tmux without a shell and report its stderr if it cannot start.
 pub fn spawn(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> io::Result<()> {
     require_directory(cwd)?;
-    let output = spawn_command(exe, dir, cwd, name).output()?;
+    let argv = tmux_command(exe, dir, cwd, name);
+    let output = Command::new(&argv[0]).args(&argv[1..]).output()?;
     if output.status.success() {
         return Ok(());
     }
@@ -133,20 +125,18 @@ mod tests {
     }
 
     #[test]
-    fn the_spawned_agent_cannot_get_a_shell_from_the_environment() {
-        let command = spawn_command(
+    fn the_shell_override_rides_in_the_pane_command() {
+        let argv = tmux_command(
             Path::new("/usr/local/bin/rigagent"),
             Path::new("/home/me/.jarvo/office"),
             Path::new("/home/me/code/api"),
             "api",
         );
-        let (_, shell) = command
-            .get_envs()
-            .find(|(key, _)| key.to_string_lossy() == "RIGAGENT_SHELL_DIR")
-            .expect("the child environment pins RIGAGENT_SHELL_DIR");
+        let exe = "/usr/local/bin/rigagent";
         assert!(
-            shell.is_some_and(|value| value.is_empty()),
-            "an empty RIGAGENT_SHELL_DIR turns the shell off: {shell:?}"
+            argv.windows(3)
+                .any(|w| w[0] == "/usr/bin/env" && w[1] == "RIGAGENT_SHELL_DIR=" && w[2] == exe),
+            "the empty override must reach the Jarvo, not just the tmux client: {argv:?}"
         );
     }
 
