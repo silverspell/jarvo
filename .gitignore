@@ -12,3 +12,6 @@ docs/*.finalize.json
 docs/*.finalize-summary.json
 docs/*.browser-check.json
 docs/*.delivery.json
+
+# Brainstorming companion scratch
+.superpowers/
