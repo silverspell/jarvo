@@ -105,6 +105,9 @@ pub struct App {
     /// boundary.
     pub cursor: usize,
     pub status: Status,
+    /// Index of the assistant entry this turn is streaming into. Cleared when
+    /// the turn ends, so the next turn starts a fresh entry of its own.
+    draft: Option<usize>,
     /// First visible transcript line.
     pub scroll: u16,
     /// Whether the view sticks to the newest output.
@@ -153,6 +156,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             status: Status::Idle,
+            draft: None,
             scroll: 0,
             follow: true,
             busy: false,
@@ -261,16 +265,30 @@ impl App {
         });
     }
 
-    /// Append `delta` to the assistant entry in progress, starting one if the
-    /// last entry is not already the assistant's.
-    pub fn push_delta(&mut self, delta: &str) {
-        match self.entries.last_mut() {
-            Some(entry) if entry.role == Role::Assistant => entry.text.push_str(delta),
-            _ => self.entries.push(Entry {
-                role: Role::Assistant,
-                text: delta.to_string(),
-            }),
+    /// The assistant entry in progress, if the draft index still points at one.
+    ///
+    /// The check keeps a stale index from writing into a different entry after
+    /// the transcript is cleared mid-turn.
+    fn draft_entry(&self) -> Option<usize> {
+        let index = self.draft?;
+        match self.entries.get(index) {
+            Some(entry) if entry.role == Role::Assistant => Some(index),
+            _ => None,
         }
+    }
+
+    /// Append `delta` to the assistant entry in progress, starting one if
+    /// there is none. Intervening user or system entries are left alone.
+    pub fn push_delta(&mut self, delta: &str) {
+        let index = self.draft_entry().unwrap_or_else(|| {
+            self.entries.push(Entry {
+                role: Role::Assistant,
+                text: String::new(),
+            });
+            self.draft = Some(self.entries.len() - 1);
+            self.entries.len() - 1
+        });
+        self.entries[index].text.push_str(delta);
     }
 
     // ---- scrolling -----------------------------------------------------
@@ -319,6 +337,7 @@ impl App {
             AgentEvent::Started { .. } => {
                 self.busy = true;
                 self.status = Status::Generating;
+                self.draft = None;
             }
             AgentEvent::Queued { text, depth } => {
                 self.push(Role::System, format!("queued ({depth}): {text}"));
@@ -342,19 +361,18 @@ impl App {
                 self.busy = false;
                 self.status = Status::Idle;
                 // A non-streaming turn (structured output) produces no deltas,
-                // so the text may not be on screen yet.
-                match self.entries.last() {
-                    Some(entry) if entry.role == Role::Assistant => {
-                        if let Some(entry) = self.entries.last_mut() {
-                            entry.text = text;
-                        }
-                    }
-                    _ if !text.is_empty() => self.push(Role::Assistant, text),
-                    _ => {}
+                // so the text may not be on screen yet. Writing through the
+                // draft keeps a queued turn's entries from being overwritten.
+                match self.draft_entry() {
+                    Some(index) => self.entries[index].text = text,
+                    None if !text.is_empty() => self.push(Role::Assistant, text),
+                    None => {}
                 }
+                self.draft = None;
             }
             AgentEvent::Failed(message) => {
                 self.busy = false;
+                self.draft = None;
                 self.status = Status::Error(message.clone());
                 self.push(Role::System, format!("error: {message}"));
             }
@@ -472,6 +490,67 @@ mod tests {
         let last = app.entries.last().expect("entry");
         assert_eq!(last.role, Role::User);
         assert_eq!(last.text, "from the room");
+    }
+
+    #[test]
+    fn a_queued_turn_gets_its_own_assistant_entry() {
+        let mut app = app();
+        app.push(Role::User, "q1");
+        app.apply_event(AgentEvent::Started {
+            prompt: "q1".into(),
+        });
+        app.apply_event(AgentEvent::Delta("par".into()));
+
+        // What `submit` and the agent do while the first turn is still running.
+        app.push(Role::User, "q2");
+        app.apply_event(AgentEvent::Queued {
+            text: "q2".into(),
+            depth: 1,
+        });
+        app.apply_event(AgentEvent::Delta("tial".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "first answer".into(),
+        });
+
+        app.apply_event(AgentEvent::Started {
+            prompt: "q2".into(),
+        });
+        app.apply_event(AgentEvent::Delta("second".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "second answer".into(),
+        });
+
+        let answers: Vec<&str> = app
+            .entries
+            .iter()
+            .filter(|entry| entry.role == Role::Assistant)
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(answers, ["first answer", "second answer"]);
+    }
+
+    #[test]
+    fn clearing_the_transcript_mid_turn_starts_a_fresh_draft() {
+        let mut app = app();
+        app.apply_event(AgentEvent::Started {
+            prompt: "q1".into(),
+        });
+        app.apply_event(AgentEvent::Delta("partial".into()));
+
+        // `/clear` empties the vector; the in-flight turn keeps streaming.
+        app.entries.clear();
+        app.apply_event(AgentEvent::Delta("after clear".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "done".into(),
+        });
+
+        let answers: Vec<&str> = app
+            .entries
+            .iter()
+            .filter(|entry| entry.role == Role::Assistant)
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(answers, ["done"]);
     }
 
     #[test]
