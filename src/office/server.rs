@@ -164,7 +164,18 @@ impl Room {
             .map(|agent| agent.info.name.as_str())
     }
 
+    /// Live agents only: a plain HTTP client has no `Left` frame to explain a
+    /// departed one, so it must not be offered a ghost.
     fn roster(&self) -> Vec<AgentInfo> {
+        self.agents
+            .values()
+            .filter(|agent| agent.connected)
+            .map(|agent| agent.info.clone())
+            .collect()
+    }
+
+    /// Every agent still in its grace window, live or not.
+    fn all_roster(&self) -> Vec<AgentInfo> {
         self.agents
             .values()
             .map(|agent| agent.info.clone())
@@ -177,7 +188,7 @@ impl Room {
     /// never start its removal timer.
     fn welcome(&self) -> Vec<ToBrowser> {
         let mut messages = vec![ToBrowser::Roster {
-            agents: self.roster(),
+            agents: self.all_roster(),
         }];
         messages.extend(
             self.agents
@@ -274,11 +285,13 @@ async fn handle_browser_message(
     match message {
         FromBrowser::Select { id } => {
             let room = room.lock().await;
-            let events = room
+            let Some(events) = room
                 .agents
                 .get(&id.0)
                 .map(|agent| agent.tail.iter().cloned().collect())
-                .unwrap_or_default();
+            else {
+                return Some(refused(id, "no such agent"));
+            };
             Some(ToBrowser::Tail { id, events })
         }
         FromBrowser::Send { id, text } => {
@@ -772,6 +785,44 @@ mod tests {
             .expect("body");
         let agents: Vec<AgentInfo> = serde_json::from_slice(&body).expect("roster json");
         assert!(agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gone_agent_is_not_in_the_http_roster() {
+        let office = Office::new(KEY.to_vec(), Path::new("/tmp"));
+        let (outbox, _inbox) = mpsc::channel(8);
+        let (info, generation) = office.join(agent("a", "bob"), outbox).await;
+        assert_eq!(office.roster().await.len(), 1);
+
+        office
+            .agent_gone(&info.id, generation)
+            .await
+            .expect("the socket closed");
+
+        assert!(
+            office.roster().await.is_empty(),
+            "HTTP has no Left frame, so it must not report a departed agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn selecting_an_unknown_agent_is_refused() {
+        let room = Mutex::new(Room::new());
+        let reply = handle_browser_message(
+            &room,
+            Path::new("/tmp"),
+            FromBrowser::Select {
+                id: AgentId("nope".into()),
+            },
+        )
+        .await;
+        match reply {
+            Some(ToBrowser::Refused { id, reason }) => {
+                assert_eq!(id.0, "nope");
+                assert!(reason.contains("no such agent"), "{reason}");
+            }
+            other => panic!("an unknown agent must be refused, got {other:?}"),
+        }
     }
 
     #[tokio::test]

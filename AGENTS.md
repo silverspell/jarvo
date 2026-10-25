@@ -83,10 +83,11 @@ included — while the TUI still receives it. The connection is
 opt-in, and every failure to join — an unusable directory, a server that will
 not start, a refused connection — is a note in the conversation, never a
 startup failure or a stalled turn. A socket that drops after joining ends
-silently; nothing retries it. The one wait is registration polling, bounded at
-five seconds for a freshly spawned server and over before the TUI opens;
-`connect_async` and the Hello send are not separately timed. Nothing on the
-turn or key path waits on the office. Never log the bearer
+silently; nothing retries it. Registration polling is bounded at five seconds
+for a freshly spawned server, and the WebSocket connect plus Hello send share
+a second five-second timeout; both happen before the TUI opens, so a wedged
+server becomes a note rather than a stalled startup. Nothing on the turn or
+key path waits on the office. Never log the bearer
 token: it lives in the registration file (mode `0600`) and in the page URL, and
 error messages name the port, not the token. The server itself prints the URL
 on stdout only when run as `--serve-office`; an auto-started server's output is
@@ -104,6 +105,7 @@ step; edit its three files directly.
 | `src/config.rs` | Clap arguments merged with the environment |
 | `src/providers.rs` | Provider clients, returns a `DynModel<Completion>` |
 | `src/agent.rs` | Agent task, streaming, history, structured output |
+| `src/command.rs` | The shared `/` parser used by the TUI and the office server; pure, no I/O |
 | `src/tools.rs` | Native tools: `#[rig_tool]` functions and `run_shell` |
 | `src/docs.rs` | Markdown document store and the `read_skill` tool |
 | `src/mcp.rs` | Optional stdio MCP clients |
@@ -129,8 +131,9 @@ abstraction layer over Rig.
 - The footer is budgeted for 80 columns. The hints were shortened to make room
   for the context gauge; a test asserts the row still fits and still shows
   both. Check that test before adding anything to the footer.
-- Quit commands are handled before the busy guard in `submit`, so they work
-  mid-turn like `Ctrl+C`. That ordering is the feature.
+- Quit commands are recognized in `submit` before the input is consumed, so
+  they work mid-turn like `Ctrl+C`. A second message is queued rather than
+  refused; there is no busy guard.
 - `push` and `push_delta` deliberately leave `follow` alone. Setting it there
   is the obvious-looking line, and it makes the transcript unscrollable while
   anything is streaming: the next delta snaps the reader back down. Only an

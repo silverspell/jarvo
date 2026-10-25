@@ -24,9 +24,13 @@ pub struct Registration {
 
 /// Read `<dir>/office.json`, if it describes a live server.
 pub fn find(dir: &Path) -> Option<Registration> {
-    let raw = fs::read_to_string(dir.join("office.json")).ok()?;
-    let registration: Registration = serde_json::from_str(&raw).ok()?;
+    let registration = read_registration(dir)?;
     (is_alive(registration.pid) == Some(true)).then_some(registration)
+}
+
+fn read_registration(dir: &Path) -> Option<Registration> {
+    let raw = fs::read_to_string(dir.join("office.json")).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 /// Try to become the one that starts the office.
@@ -103,6 +107,7 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 
 pub fn publish(dir: &Path, registration: &Registration) -> io::Result<()> {
     let json = serde_json::to_vec(registration).map_err(io::Error::other)?;
+    let temp = dir.join(format!("office.json.tmp-{}", std::process::id()));
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -110,15 +115,23 @@ pub fn publish(dir: &Path, registration: &Registration) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(dir.join("office.json"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // `mode` above only applies at creation; an older registration with
-        // wider permissions must not keep them, since it carries the token.
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let written = (|| {
+        let mut file = options.open(&temp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // `mode` only applies at creation; an older temp with wider
+            // permissions must not keep them, since the file carries a token.
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&json)
+    })();
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
-    file.write_all(&json)
+    // A rename is atomic on Unix: `find` never reads a half-written token.
+    fs::rename(&temp, dir.join("office.json"))
 }
 
 fn create_office_dir(dir: &Path) -> io::Result<()> {
@@ -148,6 +161,19 @@ fn take_lock(lock: &Path) -> io::Result<()> {
 }
 
 fn is_stale(dir: &Path, lock: &Path) -> bool {
+    // The registration names the server process, which is the thing that must
+    // be alive. A live server is never replaced, whatever the lock says; a
+    // dead one is stale even while the Jarvo that started it still runs.
+    let registration = read_registration(dir);
+    if let Some(registration) = &registration {
+        match is_alive(registration.pid) {
+            Some(true) => return false,
+            Some(false) => return true,
+            // Could not ask `kill`; fall through to the conservative lock age.
+            None => {}
+        }
+    }
+
     let pid = fs::read_to_string(lock)
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok());
@@ -157,8 +183,8 @@ fn is_stale(dir: &Path, lock: &Path) -> bool {
     };
     match is_alive(pid) {
         Some(false) => true,
-        // The winner died mid-startup if there is still no registration.
-        Some(true) => !dir.join("office.json").exists() && older_than(lock, STALE_AFTER),
+        // The winner died mid-startup if there is still no usable registration.
+        Some(true) => registration.is_none() && older_than(lock, STALE_AFTER),
         // Could not ask `kill`; let age decide rather than steal a live one.
         None => older_than(lock, STALE_AFTER),
     }
@@ -244,6 +270,61 @@ mod tests {
             !claim(dir.path()).expect("second"),
             "the reclaimer now holds the office"
         );
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap the child");
+        pid
+    }
+
+    #[test]
+    fn a_dead_server_behind_a_live_lock_is_reclaimed() {
+        let dir = tempdir();
+        let registration = Registration {
+            host: "127.0.0.1".into(),
+            port: 7777,
+            pid: dead_pid(),
+            token: "t".into(),
+        };
+        publish(dir.path(), &registration).expect("publish");
+        std::fs::write(
+            dir.path().join("office.lock"),
+            std::process::id().to_string(),
+        )
+        .expect("a live starter lock");
+
+        assert!(
+            claim(dir.path()).expect("reclaim"),
+            "a dead server must not be held open by the starter's live lock"
+        );
+        assert!(find(dir.path()).is_none(), "the stale registration is gone");
+    }
+
+    #[test]
+    fn a_live_registration_is_never_stolen() {
+        let dir = tempdir();
+        let registration = Registration {
+            host: "127.0.0.1".into(),
+            port: 7777,
+            pid: std::process::id(),
+            token: "t".into(),
+        };
+        publish(dir.path(), &registration).expect("publish");
+        std::fs::write(dir.path().join("office.lock"), dead_pid().to_string())
+            .expect("a dead starter lock");
+
+        assert!(
+            !claim(dir.path()).expect("join"),
+            "a live server is never replaced"
+        );
+        assert!(find(dir.path()).is_some(), "the live registration survives");
     }
 
     #[test]

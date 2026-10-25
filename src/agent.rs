@@ -385,6 +385,7 @@ impl AgentTask {
         commands: &mut mpsc::Receiver<AgentCommand>,
         events: &EventSink,
     ) -> bool {
+        let label = display_line(&command);
         match command {
             AgentCommand::Reset => {
                 self.history.clear();
@@ -394,13 +395,13 @@ impl AgentTask {
                     .is_ok()
             }
             AgentCommand::Prompt { text, origin } => {
-                if !announce(events, &text, origin).await {
+                if !announce(events, &label, origin).await {
                     return false;
                 }
                 drive_turn(self.stream_turn(&text, events), queue, commands, events).await
             }
             AgentCommand::Structured { text, origin } => {
-                if !announce(events, &format!("/json {text}"), origin).await {
+                if !announce(events, &label, origin).await {
                     return false;
                 }
                 drive_turn(self.structured_turn(&text, events), queue, commands, events).await
@@ -410,7 +411,7 @@ impl AgentTask {
                 request,
                 origin,
             } => {
-                if !announce(events, &skill_line(&name, &request), origin).await {
+                if !announce(events, &label, origin).await {
                     return false;
                 }
                 match self.skills.body(&name) {

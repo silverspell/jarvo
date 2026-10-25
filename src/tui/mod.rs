@@ -234,6 +234,8 @@ async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
     app.scroll_to_bottom();
 
     let command = match command::parse(&text, &app.skills) {
+        // The early check above already caught this; the arm is defensive so
+        // the match stays total without an `unreachable!()` panic.
         Input::Quit => {
             app.should_quit = true;
             return Ok(());

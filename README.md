@@ -491,14 +491,12 @@ not retried.
 
 Limitations, plainly:
 
-- **No reconnect.** If the office server dies, the room is gone; the page shows
-  a banner. With the default `127.0.0.1:0` a restart usually publishes a new
-  port, so reopen the new tokenised URL from the new note rather than
-  reloading the old page. A Jarvo that loses its socket does not retry either.
-- **The starter's lock outlives the server.** While the Jarvo that started the
-  office is still running, its lock prevents another Jarvo from reclaiming the
-  directory, so a dead server stays dead. Quit that Jarvo, or clear the office
-  directory, before starting a new one.
+- **No reconnect.** If the office server dies, the page shows a banner and a
+  Jarvo that lost its socket does not retry. A later Jarvo pointed at the
+  directory can reclaim the dead registration and start a fresh room, but the
+  already-running Jarvos do not join it. With the default `127.0.0.1:0` a
+  restart publishes a new port, so reopen the new tokenised URL from the new
+  note rather than reloading the old page.
 - **No durable history.** The room keeps the latest 200 events per agent in
   memory so a browser arriving late can catch up; nothing is written down.
 - **One office per directory**, with one bearer token — meant for one user on
@@ -573,6 +571,7 @@ src/
 ├── config.rs      CLI arguments and environment
 ├── providers.rs   provider and model initialization
 ├── agent.rs       conversation, streaming, tools, structured output
+├── command.rs     the shared slash-command parser
 ├── tools.rs       native tool implementations
 ├── docs.rs        skill library and the read_skill tool
 ├── mcp.rs         optional MCP client setup
