@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +26,7 @@ use super::protocol::{
     AgentId, AgentInfo, FromAgent, FromBrowser, ToAgent, ToBrowser, TurnEvent, TurnId,
 };
 use super::registry::{self, Registration};
+use super::spawn;
 use crate::command::{self, Input};
 
 /// Events kept per agent so a browser arriving late can catch up.
@@ -45,15 +46,18 @@ const STYLE: &str = include_str!("web/style.css");
 #[derive(Clone)]
 struct Office {
     key: Arc<Vec<u8>>,
+    /// The office directory a spawned Jarvo is told to join.
+    dir: Arc<PathBuf>,
     room: Arc<Mutex<Room>>,
     browsers: broadcast::Sender<ToBrowser>,
 }
 
 impl Office {
-    fn new(key: Vec<u8>) -> Self {
+    fn new(key: Vec<u8>, dir: impl Into<PathBuf>) -> Self {
         let (browsers, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             key: Arc::new(key),
+            dir: Arc::new(dir.into()),
             room: Arc::new(Mutex::new(Room::new())),
             browsers,
         }
@@ -238,7 +242,11 @@ fn unique_name<'a>(taken: impl IntoIterator<Item = &'a str>, base: &str) -> Stri
 }
 
 /// Handle one browser frame without sockets, so the room rules stay testable.
-async fn handle_browser_message(room: &Mutex<Room>, message: FromBrowser) -> Option<ToBrowser> {
+async fn handle_browser_message(
+    room: &Mutex<Room>,
+    dir: &Path,
+    message: FromBrowser,
+) -> Option<ToBrowser> {
     match message {
         FromBrowser::Select { id } => {
             let room = room.lock().await;
@@ -274,11 +282,27 @@ async fn handle_browser_message(room: &Mutex<Room>, message: FromBrowser) -> Opt
                 Err(_) => Some(refused(id, "the agent is not connected")),
             }
         }
-        // Task 10 replaces this with a real spawn. Until then, say so.
-        FromBrowser::Spawn { .. } => Some(refused(
-            AgentId(String::new()),
-            "spawning is not available yet",
-        )),
+        FromBrowser::Spawn { cwd, name } => {
+            let cwd = PathBuf::from(cwd);
+            let name = match name {
+                Some(name) if !name.trim().is_empty() => name,
+                _ => cwd
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "agent".into()),
+            };
+            let started = std::env::current_exe()
+                .map_err(|err| format!("cannot find this program: {err}"))
+                .and_then(|exe| {
+                    spawn::spawn(&exe, dir, &cwd, &name)
+                        .map_err(|err| format!("cannot start the agent: {err}"))
+                });
+            match started {
+                // The new Jarvo announces itself with `Joined` on connect.
+                Ok(()) => None,
+                Err(reason) => Some(refused(AgentId(String::new()), &reason)),
+            }
+        }
     }
 }
 
@@ -414,7 +438,7 @@ async fn browser_socket(mut socket: WebSocket, state: Office) {
                 let Ok(message) = serde_json::from_str::<FromBrowser>(text.as_str()) else {
                     continue;
                 };
-                if let Some(reply) = handle_browser_message(&state.room, message).await
+                if let Some(reply) = handle_browser_message(&state.room, &state.dir, message).await
                     && !send_json(&mut socket, &reply).await
                 {
                     return;
@@ -494,7 +518,7 @@ pub async fn serve(dir: &Path, bind: &str) -> Result<()> {
     let key = auth::load_or_create_key(dir)
         .with_context(|| format!("cannot load the office key in {}", dir.display()))?;
     let token = auth::issue(&key, "office").context("cannot issue the office token")?;
-    let state = Office::new(key);
+    let state = Office::new(key, dir);
 
     let registration = Registration {
         port: bound.port(),
@@ -532,7 +556,7 @@ mod tests {
 
     fn router_for_tests() -> (Router, String) {
         let token = auth::issue(KEY, "browser").expect("issue");
-        (router(Office::new(KEY.to_vec())), token)
+        (router(Office::new(KEY.to_vec(), Path::new("/tmp"))), token)
     }
 
     #[tokio::test]
@@ -631,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reconnect_keeps_the_sequence_beside_the_old_tail() {
-        let office = Office::new(KEY.to_vec());
+        let office = Office::new(KEY.to_vec(), Path::new("/tmp"));
         let (first_outbox, _first_inbox) = mpsc::channel(8);
         let (info, generation) = office.join(agent("a", "bob"), first_outbox).await;
         office
@@ -737,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn turns_carry_increasing_sequences_and_the_tail_keeps_them() {
-        let office = Office::new(KEY.to_vec());
+        let office = Office::new(KEY.to_vec(), Path::new("/tmp"));
         let (outbox, _inbox) = mpsc::channel(8);
         let (info, generation) = office.join(agent("a", "bob"), outbox).await;
         let mut turns = office.browsers.subscribe();
@@ -774,6 +798,7 @@ mod tests {
 
         let reply = handle_browser_message(
             &office.room,
+            Path::new("/tmp"),
             FromBrowser::Select {
                 id: info.id.clone(),
             },
@@ -799,6 +824,7 @@ mod tests {
         for text in ["/clear", "/quit"] {
             let reply = handle_browser_message(
                 &room,
+                Path::new("/tmp"),
                 FromBrowser::Send {
                     id: id.clone(),
                     text: text.into(),
@@ -897,7 +923,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_socket_cannot_mark_a_reconnected_agent_gone() {
-        let office = Office::new(KEY.to_vec());
+        let office = Office::new(KEY.to_vec(), Path::new("/tmp"));
         let (first_outbox, _first_inbox) = mpsc::channel(8);
         let (info, stale) = office.join(agent("a", "bob"), first_outbox).await;
 
