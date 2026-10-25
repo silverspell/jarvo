@@ -37,6 +37,7 @@ anyhow = "1"
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 rand = "0.10.3"
 axum = { version = "0.8.9", features = ["ws"] }
+tokio-tungstenite = "0.30.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

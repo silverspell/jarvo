@@ -1,7 +1,3 @@
-// The office wire types are consumed by Tasks 5-10; drop this allow once they
-// are wired up.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 /// Stable for the life of one process.

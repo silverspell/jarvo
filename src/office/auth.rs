@@ -1,8 +1,5 @@
 //! Signing and checking the office's session tokens.
 //!
-//! Consumers arrive in Task 7; drop this allow once the server is wired up.
-#![allow(dead_code)]
-
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;

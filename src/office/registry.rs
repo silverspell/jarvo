@@ -1,7 +1,4 @@
 //! Which Jarvo starts, and owns, the office for this directory.
-//!
-//! Consumers arrive in Tasks 7-10; drop this allow once they are wired up.
-#![allow(dead_code)]
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};

@@ -177,15 +177,10 @@ pub struct Config {
     /// Working directory for shell commands. `None` disables the tool.
     pub shell_dir: Option<PathBuf>,
     /// Directory holding the office registration. `None` means the office is off.
-    // The office fields are read by the server and agent tasks in later tasks;
-    // drop these allows once they are wired up.
-    #[allow(dead_code)]
     pub office_dir: Option<PathBuf>,
     /// This agent's name in the office. `None` means name it after the directory.
-    #[allow(dead_code)]
     pub office_name: Option<String>,
     /// Address the office server listens on.
-    #[allow(dead_code)]
     pub office_bind: String,
     /// The provider credential, if the chosen provider needs one.
     pub api_key: Option<String>,

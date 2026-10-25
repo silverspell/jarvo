@@ -23,6 +23,8 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::docs::{Docs, ReadSkill};
 use crate::mcp;
+use crate::office::client;
+use crate::office::protocol::{AgentId, AgentInfo};
 use crate::providers;
 use crate::tools::{GetCurrentTime, RunShell, SpawnAgent};
 
@@ -73,8 +75,6 @@ impl AnswerCard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Tui,
-    // Wired up with the office in a later task; nothing constructs it yet.
-    #[allow(dead_code)]
     Office,
 }
 
@@ -100,11 +100,7 @@ pub enum AgentCommand {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// A turn has begun, carrying the display line for it.
-    Started {
-        // Mapped to the office's turn event in a later task; the TUI ignores it.
-        #[allow(dead_code)]
-        prompt: String,
-    },
+    Started { prompt: String },
     /// A command arrived mid-turn and is waiting; `depth` includes it.
     Queued { text: String, depth: usize },
     /// A prompt that did not come from this TUI, echoed so the terminal shows
@@ -152,8 +148,6 @@ impl EventSink {
     }
 
     /// Add a listener whose events may be dropped.
-    // Wired to the office in a later task; the tests below already exercise it.
-    #[allow(dead_code)]
     pub fn with_extra(mut self, extra: mpsc::Sender<AgentEvent>) -> Self {
         self.extra = Some(extra);
         self
@@ -281,6 +275,21 @@ pub async fn start(config: &Config) -> Result<Started> {
     let _ = agent_cell.set(agent.clone());
 
     let (command_tx, command_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let handle = AgentHandle {
+        commands: command_tx,
+    };
+
+    // The office is optional: `join` turns every failure into a note and may
+    // take a few seconds while a freshly spawned server registers.
+    let mut sink = EventSink::new(event_tx);
+    if let Some(dir) = &config.office_dir {
+        let info = office_info(config, skills.ids());
+        let (extra, note) = client::join(dir, &config.office_bind, info, handle.clone()).await;
+        if let Some(extra) = extra {
+            sink = sink.with_extra(extra);
+        }
+        notes.push(note);
+    }
 
     let task = AgentTask {
         agent,
@@ -292,16 +301,44 @@ pub async fn start(config: &Config) -> Result<Started> {
         // as long as the agent exists.
         _mcp: mcp_tools.connections,
     };
-    tokio::spawn(task.run(command_rx, EventSink::new(event_tx)));
+    tokio::spawn(task.run(command_rx, sink));
 
     Ok(Started {
-        handle: AgentHandle {
-            commands: command_tx,
-        },
+        handle,
         events: event_rx,
         notes,
         skills: skills.ids(),
     })
+}
+
+/// Who this Jarvo is in the office.
+fn office_info(config: &Config, skills: Vec<String>) -> AgentInfo {
+    let cwd = std::env::current_dir().ok();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    AgentInfo {
+        id: AgentId(format!("{}-{nanos}", std::process::id())),
+        name: office_name(config.office_name.as_deref(), cwd.as_deref()),
+        model: config.header_label(),
+        cwd: cwd
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        skills,
+    }
+}
+
+/// The configured name, else the working directory's, else a generic one.
+fn office_name(configured: Option<&str>, cwd: Option<&Path>) -> String {
+    configured
+        .map(str::to_string)
+        .or_else(|| {
+            cwd.and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "agent".into())
 }
 
 /// The agent and the conversation it owns.
@@ -729,6 +766,17 @@ mod tests {
             confidence["maximum"], 1.0,
             "schema should bound confidence: {schema}"
         );
+    }
+
+    #[test]
+    fn an_offices_name_falls_back_to_the_directory_then_a_generic_one() {
+        assert_eq!(
+            office_name(Some("boss"), Some(Path::new("/work/room"))),
+            "boss"
+        );
+        assert_eq!(office_name(None, Some(Path::new("/work/room"))), "room");
+        assert_eq!(office_name(None, Some(Path::new("/"))), "agent");
+        assert_eq!(office_name(None, None), "agent");
     }
 
     #[tokio::test]
