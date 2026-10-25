@@ -1,8 +1,11 @@
 # The Office Implementation Plan
 
-> **For the implementer:** work task by task, in order. Each task ends with
-> green tests and a commit. Do not start a task before the previous one's
-> tests pass. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> superpowers:subagent-driven-development (recommended) or
+> superpowers:executing-plans to implement this plan task-by-task. Steps use
+> checkbox (`- [ ]`) syntax for tracking. Work in order; each task ends with
+> green tests and a commit, and no task starts before the previous one's tests
+> pass.
 
 **Goal:** Several running Jarvos appear as characters in one web page; clicking
 one opens its live transcript and a box that sends it commands.
