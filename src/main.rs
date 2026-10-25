@@ -4,9 +4,11 @@
 //! [`config`]); the interface runs in [`tui`] and the model in [`agent`].
 
 mod agent;
+mod command;
 mod config;
 mod docs;
 mod mcp;
+mod office;
 mod providers;
 mod tools;
 mod tui;

@@ -18,6 +18,7 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 
 use crate::agent::{self, AgentCommand, AgentEvent};
+use crate::command::{self, Input, QUIT_COMMANDS};
 use crate::config::Config;
 use app::{App, Role, Status};
 
@@ -165,9 +166,6 @@ async fn event_loop(
     }
 }
 
-/// Input that closes the application, each equivalent to Ctrl+C.
-const QUIT_COMMANDS: [&str; 3] = ["/quit", "/exit", "/bye"];
-
 /// Apply one key press, sending a command to the agent when a message is
 /// submitted.
 async fn handle_key(app: &mut App, key: KeyEvent, handle: &agent::AgentHandle) -> Result<()> {
@@ -218,17 +216,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-/// The skill `text` invokes, if its first word names one.
-///
-/// Checked against the loaded library rather than a pattern, so an unknown
-/// `/command` still reaches the model as ordinary text instead of silently
-/// doing nothing.
-fn skill_command(text: &str, skills: &[String]) -> Option<String> {
-    let rest = text.strip_prefix('/')?;
-    let name = rest.split_whitespace().next()?;
-    skills.iter().find(|skill| skill.as_str() == name).cloned()
-}
-
 /// Send the input buffer to the agent, honouring the `/` commands.
 async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
     // Checked before the busy guard, and before the input is consumed, so a
@@ -250,30 +237,37 @@ async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
     // following after the user has scrolled back to read something.
     app.scroll_to_bottom();
 
-    let command = if let Some(rest) = text.strip_prefix("/json") {
-        let prompt = rest.trim();
-        if prompt.is_empty() {
+    let command = match command::parse(&text, &app.skills) {
+        Input::Quit => {
+            app.should_quit = true;
+            return Ok(());
+        }
+        Input::JsonWithoutAPrompt => {
             app.push(Role::System, "usage: /json <prompt>");
             return Ok(());
         }
-        app.push(Role::User, text.clone());
-        app.push(
-            Role::System,
-            "requesting a structured answer (not streamed)",
-        );
-        AgentCommand::Structured(prompt.to_string())
-    } else if let Some(name) = skill_command(&text, &app.skills) {
-        let request = text[1 + name.len()..].trim().to_string();
-        app.push(Role::User, text.clone());
-        app.push(Role::System, format!("running skill: {name}"));
-        AgentCommand::Skill { name, request }
-    } else if text == "/clear" {
-        app.entries.clear();
-        app.status = Status::Idle;
-        AgentCommand::Reset
-    } else {
-        app.push(Role::User, text.clone());
-        AgentCommand::Prompt(text)
+        Input::Structured(prompt) => {
+            app.push(Role::User, text.clone());
+            app.push(
+                Role::System,
+                "requesting a structured answer (not streamed)",
+            );
+            AgentCommand::Structured(prompt)
+        }
+        Input::Skill { name, request } => {
+            app.push(Role::User, text.clone());
+            app.push(Role::System, format!("running skill: {name}"));
+            AgentCommand::Skill { name, request }
+        }
+        Input::Clear => {
+            app.entries.clear();
+            app.status = Status::Idle;
+            AgentCommand::Reset
+        }
+        Input::Prompt(prompt) => {
+            app.push(Role::User, text.clone());
+            AgentCommand::Prompt(prompt)
+        }
     };
 
     handle.send(command).await
