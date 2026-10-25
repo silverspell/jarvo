@@ -105,6 +105,9 @@ pub struct App {
     /// boundary.
     pub cursor: usize,
     pub status: Status,
+    /// Index of the assistant entry this turn is streaming into. Cleared when
+    /// the turn ends, so the next turn starts a fresh entry of its own.
+    draft: Option<usize>,
     /// First visible transcript line.
     pub scroll: u16,
     /// Whether the view sticks to the newest output.
@@ -153,6 +156,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             status: Status::Idle,
+            draft: None,
             scroll: 0,
             follow: true,
             busy: false,
@@ -261,16 +265,30 @@ impl App {
         });
     }
 
-    /// Append `delta` to the assistant entry in progress, starting one if the
-    /// last entry is not already the assistant's.
-    pub fn push_delta(&mut self, delta: &str) {
-        match self.entries.last_mut() {
-            Some(entry) if entry.role == Role::Assistant => entry.text.push_str(delta),
-            _ => self.entries.push(Entry {
-                role: Role::Assistant,
-                text: delta.to_string(),
-            }),
+    /// The assistant entry in progress, if the draft index still points at one.
+    ///
+    /// The check keeps a stale index from writing into a different entry after
+    /// the transcript is cleared mid-turn.
+    fn draft_entry(&self) -> Option<usize> {
+        let index = self.draft?;
+        match self.entries.get(index) {
+            Some(entry) if entry.role == Role::Assistant => Some(index),
+            _ => None,
         }
+    }
+
+    /// Append `delta` to the assistant entry in progress, starting one if
+    /// there is none. Intervening user or system entries are left alone.
+    pub fn push_delta(&mut self, delta: &str) {
+        let index = self.draft_entry().unwrap_or_else(|| {
+            self.entries.push(Entry {
+                role: Role::Assistant,
+                text: String::new(),
+            });
+            self.draft = Some(self.entries.len() - 1);
+            self.entries.len() - 1
+        });
+        self.entries[index].text.push_str(delta);
     }
 
     // ---- scrolling -----------------------------------------------------
@@ -316,19 +334,28 @@ impl App {
     /// Fold one agent event into the state.
     pub fn apply_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::Started => {
+            AgentEvent::Started { .. } => {
                 self.busy = true;
                 self.status = Status::Generating;
+                self.draft = None;
             }
+            AgentEvent::Queued { text, depth } => {
+                self.push(Role::System, format!("queued ({depth}): {text}"));
+            }
+            AgentEvent::Accepted { text } => self.push(Role::User, text),
             AgentEvent::Delta(delta) => {
                 self.status = Status::Generating;
                 self.push_delta(&delta);
             }
             AgentEvent::ToolCall { name } => {
+                // The narration so far ends here; anything after the tool is a
+                // new assistant entry, below the tool log.
+                self.draft = None;
                 self.status = Status::Tool(name.clone());
                 self.push(Role::System, format!("→ {name}"));
             }
             AgentEvent::ToolResult { name } => {
+                self.draft = None;
                 self.status = Status::Generating;
                 self.push(Role::System, format!("← {name}"));
             }
@@ -338,19 +365,18 @@ impl App {
                 self.busy = false;
                 self.status = Status::Idle;
                 // A non-streaming turn (structured output) produces no deltas,
-                // so the text may not be on screen yet.
-                match self.entries.last() {
-                    Some(entry) if entry.role == Role::Assistant => {
-                        if let Some(entry) = self.entries.last_mut() {
-                            entry.text = text;
-                        }
-                    }
-                    _ if !text.is_empty() => self.push(Role::Assistant, text),
-                    _ => {}
+                // so the text may not be on screen yet. Writing through the
+                // draft keeps a queued turn's entries from being overwritten.
+                match self.draft_entry() {
+                    Some(index) => self.entries[index].text = text,
+                    None if !text.is_empty() => self.push(Role::Assistant, text),
+                    None => {}
                 }
+                self.draft = None;
             }
             AgentEvent::Failed(message) => {
                 self.busy = false;
+                self.draft = None;
                 self.status = Status::Error(message.clone());
                 self.push(Role::System, format!("error: {message}"));
             }
@@ -454,9 +480,131 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_message_is_announced_and_an_office_prompt_is_echoed() {
+        let mut app = app();
+        app.apply_event(AgentEvent::Queued {
+            text: "later".into(),
+            depth: 1,
+        });
+        assert!(app.entries.last().expect("entry").text.contains("later"));
+
+        app.apply_event(AgentEvent::Accepted {
+            text: "from the room".into(),
+        });
+        let last = app.entries.last().expect("entry");
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.text, "from the room");
+    }
+
+    #[test]
+    fn a_queued_turn_gets_its_own_assistant_entry() {
+        let mut app = app();
+        app.push(Role::User, "q1");
+        app.apply_event(AgentEvent::Started {
+            prompt: "q1".into(),
+        });
+        app.apply_event(AgentEvent::Delta("par".into()));
+
+        // What `submit` and the agent do while the first turn is still running.
+        app.push(Role::User, "q2");
+        app.apply_event(AgentEvent::Queued {
+            text: "q2".into(),
+            depth: 1,
+        });
+        app.apply_event(AgentEvent::Delta("tial".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "first answer".into(),
+        });
+
+        app.apply_event(AgentEvent::Started {
+            prompt: "q2".into(),
+        });
+        app.apply_event(AgentEvent::Delta("second".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "second answer".into(),
+        });
+
+        let answers: Vec<&str> = app
+            .entries
+            .iter()
+            .filter(|entry| entry.role == Role::Assistant)
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(answers, ["first answer", "second answer"]);
+    }
+
+    #[test]
+    fn clearing_the_transcript_mid_turn_starts_a_fresh_draft() {
+        let mut app = app();
+        app.apply_event(AgentEvent::Started {
+            prompt: "q1".into(),
+        });
+        app.apply_event(AgentEvent::Delta("partial".into()));
+
+        // `/clear` empties the vector; the in-flight turn keeps streaming.
+        app.entries.clear();
+        app.apply_event(AgentEvent::Delta("after clear".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "done".into(),
+        });
+
+        let answers: Vec<&str> = app
+            .entries
+            .iter()
+            .filter(|entry| entry.role == Role::Assistant)
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(answers, ["done"]);
+    }
+
+    #[test]
+    fn a_tool_call_splits_the_narration_from_the_answer() {
+        let mut app = app();
+        app.apply_event(AgentEvent::Started { prompt: "q".into() });
+        app.apply_event(AgentEvent::Delta("I'll check".into()));
+        app.apply_event(AgentEvent::ToolCall {
+            name: "get_current_time".into(),
+        });
+        app.apply_event(AgentEvent::ToolResult {
+            name: "get_current_time".into(),
+        });
+        app.apply_event(AgentEvent::Delta("It's X".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "It's X".into(),
+        });
+
+        let entries: Vec<(Role, &str)> = app
+            .entries
+            .iter()
+            .map(|entry| (entry.role, entry.text.as_str()))
+            .collect();
+        let answers: Vec<&str> = entries
+            .iter()
+            .filter(|(role, _)| *role == Role::Assistant)
+            .map(|(_, text)| *text)
+            .collect();
+        assert_eq!(answers, ["I'll check", "It's X"]);
+
+        let position = |text: &str| {
+            entries
+                .iter()
+                .position(|(_, entry)| *entry == text)
+                .unwrap_or_else(|| panic!("missing entry: {text}"))
+        };
+        assert!(
+            position("I'll check") < position("→ get_current_time")
+                && position("→ get_current_time") < position("← get_current_time")
+                && position("← get_current_time") < position("It's X"),
+            "the tool lines sit between the narration and the answer: {entries:?}"
+        );
+    }
+
+    #[test]
     fn a_turn_starts_busy_and_ends_idle() {
         let mut app = app();
-        app.apply_event(AgentEvent::Started);
+        app.apply_event(AgentEvent::Started {
+            prompt: "hello".into(),
+        });
         assert!(app.busy);
         assert_eq!(app.status, Status::Generating);
 
@@ -477,7 +625,9 @@ mod tests {
     fn a_non_streaming_turn_still_shows_its_answer() {
         let mut app = app();
         app.push(Role::User, "/json hello");
-        app.apply_event(AgentEvent::Started);
+        app.apply_event(AgentEvent::Started {
+            prompt: "hello".into(),
+        });
         app.apply_event(AgentEvent::Completed {
             text: "{\n  \"title\": \"Hi\"\n}".into(),
         });
@@ -490,7 +640,9 @@ mod tests {
     #[test]
     fn a_failure_is_reported_and_clears_busy() {
         let mut app = app();
-        app.apply_event(AgentEvent::Started);
+        app.apply_event(AgentEvent::Started {
+            prompt: "hello".into(),
+        });
         app.apply_event(AgentEvent::Failed("no credentials".into()));
 
         assert!(!app.busy);

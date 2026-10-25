@@ -14,6 +14,9 @@ use clap::{Parser, ValueEnum};
 /// The default Ollama endpoint, used when `OLLAMA_BASE_URL` is unset.
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 
+/// The default office address: localhost on a free port, reachable only here.
+pub const DEFAULT_OFFICE_BIND: &str = "127.0.0.1:0";
+
 /// A supported model provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
@@ -134,6 +137,26 @@ pub struct Cli {
     #[arg(long, env = "RIGAGENT_SHELL_DIR", value_parser = any_path)]
     pub shell_dir: Option<PathBuf>,
 
+    /// Directory holding the office registration; unset means no office.
+    #[arg(long, env = "RIGAGENT_OFFICE_DIR", value_parser = any_path)]
+    pub office_dir: Option<PathBuf>,
+
+    /// This agent's name in the office; defaults to the directory's name.
+    #[arg(long, env = "RIGAGENT_OFFICE_NAME")]
+    pub office_name: Option<String>,
+
+    /// Address the office server listens on.
+    #[arg(
+        long,
+        env = "RIGAGENT_OFFICE_BIND",
+        default_value = DEFAULT_OFFICE_BIND
+    )]
+    pub office_bind: String,
+
+    /// Be the office server for this directory instead of a terminal agent.
+    #[arg(long, hide = true, value_parser = any_path)]
+    pub serve_office: Option<PathBuf>,
+
     /// Path to an optional MCP server configuration file.
     #[arg(long, env = "RIGAGENT_MCP_CONFIG", value_parser = any_path)]
     pub mcp_config: Option<PathBuf>,
@@ -153,6 +176,12 @@ pub struct Config {
     pub skills_dir: Option<PathBuf>,
     /// Working directory for shell commands. `None` disables the tool.
     pub shell_dir: Option<PathBuf>,
+    /// Directory holding the office registration. `None` means the office is off.
+    pub office_dir: Option<PathBuf>,
+    /// This agent's name in the office. `None` means name it after the directory.
+    pub office_name: Option<String>,
+    /// Address the office server listens on.
+    pub office_bind: String,
     /// The provider credential, if the chosen provider needs one.
     pub api_key: Option<String>,
     /// Base URL of the Ollama daemon (only meaningful for [`Provider::Ollama`]).
@@ -202,6 +231,9 @@ impl Config {
             mcp_config: non_empty_path(cli.mcp_config),
             skills_dir: non_empty_path(cli.skills_dir),
             shell_dir: non_empty_path(cli.shell_dir),
+            office_dir: non_empty_path(cli.office_dir),
+            office_name: cli.office_name.filter(|name| !name.trim().is_empty()),
+            office_bind: office_bind_or_default(cli.office_bind),
             api_key,
             ollama_base_url,
         })
@@ -258,8 +290,21 @@ fn any_path(raw: &str) -> Result<PathBuf, std::convert::Infallible> {
 /// Clap hands back `Some("")` for an environment variable that is present but
 /// empty, which `RIGAGENT_SHELL_DIR=` in a `.env` produces. That means "off",
 /// not a directory named "", exactly as a blank `--model` means "default".
-fn non_empty_path(path: Option<PathBuf>) -> Option<PathBuf> {
+pub(crate) fn non_empty_path(path: Option<PathBuf>) -> Option<PathBuf> {
     path.filter(|path| !path.as_os_str().is_empty())
+}
+
+/// A blank bind address means the default, not an empty address.
+///
+/// `RIGAGENT_OFFICE_BIND=` in a `.env` arrives as an empty string, which is
+/// not a `SocketAddr`; the server should pick localhost on a free port then.
+pub(crate) fn office_bind_or_default(raw: String) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        DEFAULT_OFFICE_BIND.to_string()
+    } else {
+        raw.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +329,43 @@ mod tests {
             non_empty_path(cli.shell_dir).as_deref(),
             Some(Path::new("/tmp"))
         );
+    }
+
+    #[test]
+    fn a_blank_office_dir_means_off_rather_than_a_startup_failure() {
+        let cli = Cli::try_parse_from(["rigagent", "--office-dir", ""])
+            .expect("an empty path must parse, as it does for --shell-dir");
+        assert_eq!(non_empty_path(cli.office_dir), None);
+
+        let cli = Cli::try_parse_from(["rigagent", "--office-dir", "/tmp/office"])
+            .expect("arguments should parse");
+        assert_eq!(
+            non_empty_path(cli.office_dir).as_deref(),
+            Some(Path::new("/tmp/office"))
+        );
+    }
+
+    #[test]
+    fn the_office_binds_to_localhost_on_a_free_port_unless_told_otherwise() {
+        let cli = Cli::try_parse_from(["rigagent"]).expect("parse");
+        assert_eq!(cli.office_bind, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn a_blank_office_bind_means_localhost_on_a_free_port() {
+        assert_eq!(office_bind_or_default(String::new()), "127.0.0.1:0");
+        assert_eq!(office_bind_or_default("   ".to_string()), "127.0.0.1:0");
+        assert_eq!(
+            office_bind_or_default("0.0.0.0:8080".to_string()),
+            "0.0.0.0:8080"
+        );
+    }
+
+    #[test]
+    fn serving_the_office_is_a_separate_mode() {
+        let cli =
+            Cli::try_parse_from(["rigagent", "--serve-office", "/tmp/office"]).expect("parse");
+        assert_eq!(cli.serve_office.as_deref(), Some(Path::new("/tmp/office")));
     }
 
     #[test]

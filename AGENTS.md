@@ -76,6 +76,27 @@ a deliberate one, and the directory is where commands start, not a sandbox.
 task; two `mpsc` channels connect them (`AgentCommand` out, `AgentEvent` in).
 Keep rendering and key handling off the model's path.
 
+**The office never slows the agent or the TUI.** Its event channel is lossy on
+purpose: `EventSink::send` awaits the TUI but `try_send`s the office, so a full
+or dead office channel drops only the office's copy of an event — deltas
+included — while the TUI still receives it. The connection is
+opt-in, and every failure to join — an unusable directory, a server that will
+not start, a refused connection — is a note in the conversation, never a
+startup failure or a stalled turn. A socket that drops after joining ends
+silently; nothing retries it. Registration polling is bounded at five seconds
+for a freshly spawned server, and the WebSocket connect plus Hello send share
+a second five-second timeout; both happen before the TUI opens, so a wedged
+server becomes a note rather than a stalled startup. Nothing on the turn or
+key path waits on the office. Never log the bearer
+token: it lives in the registration file (mode `0600`) and in the page URL, and
+error messages name the port, not the token. The server itself prints the URL
+on stdout only when run as `--serve-office`; an auto-started server's output is
+discarded so it cannot reach a TUI. An agent spawned from the room never gets a
+shell: `src/office/spawn.rs` puts `RIGAGENT_SHELL_DIR=` in the pane's
+`/usr/bin/env` command, so no inherited shell directory survives.
+`src/office/web` is served from source with `include_str!` and has no build
+step; edit its three files directly.
+
 ## Module responsibilities
 
 | File | Holds |
@@ -84,9 +105,11 @@ Keep rendering and key handling off the model's path.
 | `src/config.rs` | Clap arguments merged with the environment |
 | `src/providers.rs` | Provider clients, returns a `DynModel<Completion>` |
 | `src/agent.rs` | Agent task, streaming, history, structured output |
+| `src/command.rs` | The shared `/` parser used by the TUI and the office server; pure, no I/O |
 | `src/tools.rs` | Native tools: `#[rig_tool]` functions and `run_shell` |
 | `src/docs.rs` | Markdown document store and the `read_skill` tool |
 | `src/mcp.rs` | Optional stdio MCP clients |
+| `src/office/*` | Optional room: `protocol` wire types, `registry`/`auth` (one office per directory and its bearer token), `server` (routes, roster, sockets), `client` (join or start, notes), `spawn` (tmux), `web` (page served from source, no build step) |
 | `src/tui/mod.rs` | Terminal lifecycle, input, event loop, slash commands |
 | `src/tui/app.rs` | State machine; no terminal, no network, so it is testable |
 | `src/tui/ui.rs` | Drawing only; pure functions of `App` |
@@ -108,8 +131,9 @@ abstraction layer over Rig.
 - The footer is budgeted for 80 columns. The hints were shortened to make room
   for the context gauge; a test asserts the row still fits and still shows
   both. Check that test before adding anything to the footer.
-- Quit commands are handled before the busy guard in `submit`, so they work
-  mid-turn like `Ctrl+C`. That ordering is the feature.
+- Quit commands are recognized in `submit` before the input is consumed, so
+  they work mid-turn like `Ctrl+C`. A second message is queued rather than
+  refused; there is no busy guard.
 - `push` and `push_delta` deliberately leave `follow` alone. Setting it there
   is the obvious-looking line, and it makes the transcript unscrollable while
   anything is streaming: the next delta snaps the reader back down. Only an
