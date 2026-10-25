@@ -17,7 +17,7 @@ use crossterm::execute;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 
-use crate::agent::{self, AgentCommand, AgentEvent};
+use crate::agent::{self, AgentCommand, AgentEvent, Origin};
 use crate::command::{self, Input, QUIT_COMMANDS};
 use crate::config::Config;
 use app::{App, Role, Status};
@@ -218,15 +218,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 
 /// Send the input buffer to the agent, honouring the `/` commands.
 async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
-    // Checked before the busy guard, and before the input is consumed, so a
-    // quit command behaves exactly like Ctrl+C: it works mid-turn. A run that
-    // has gone astray must never trap the user in the interface.
+    // Checked before the input is consumed, so a quit command behaves exactly
+    // like Ctrl+C: it works mid-turn. A run that has gone astray must never
+    // trap the user in the interface.
     if QUIT_COMMANDS.contains(&app.input.trim()) {
         app.should_quit = true;
-        return Ok(());
-    }
-    if app.busy {
-        app.status = Status::Error("still working on the previous message".into());
         return Ok(());
     }
     let Some(text) = app.take_input() else {
@@ -252,12 +248,19 @@ async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
                 Role::System,
                 "requesting a structured answer (not streamed)",
             );
-            AgentCommand::Structured(prompt)
+            AgentCommand::Structured {
+                text: prompt,
+                origin: Origin::Tui,
+            }
         }
         Input::Skill { name, request } => {
             app.push(Role::User, text.clone());
             app.push(Role::System, format!("running skill: {name}"));
-            AgentCommand::Skill { name, request }
+            AgentCommand::Skill {
+                name,
+                request,
+                origin: Origin::Tui,
+            }
         }
         Input::Clear => {
             app.entries.clear();
@@ -266,7 +269,10 @@ async fn submit(app: &mut App, handle: &agent::AgentHandle) -> Result<()> {
         }
         Input::Prompt(prompt) => {
             app.push(Role::User, text.clone());
-            AgentCommand::Prompt(prompt)
+            AgentCommand::Prompt {
+                text: prompt,
+                origin: Origin::Tui,
+            }
         }
     };
 
@@ -329,6 +335,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_message_is_queued_rather_than_refused() {
+        let (mut app, handle, mut rx) = fixture();
+        app.busy = true;
+        type_in(&mut app, "second thing");
+        submit(&mut app, &handle).await.expect("submit");
+        assert!(
+            rx.try_recv().is_ok(),
+            "a busy agent still takes the message"
+        );
+        assert!(!matches!(app.status, Status::Error(_)));
+    }
+
+    #[tokio::test]
     async fn a_slash_command_naming_a_skill_runs_it() {
         let (mut app, handle, mut rx) = fixture();
         type_in(&mut app, "/teach me about borrow checking");
@@ -336,7 +355,7 @@ mod tests {
         submit(&mut app, &handle).await.expect("submit should work");
 
         match rx.try_recv() {
-            Ok(AgentCommand::Skill { name, request }) => {
+            Ok(AgentCommand::Skill { name, request, .. }) => {
                 assert_eq!(name, "teach");
                 assert_eq!(request, "me about borrow checking");
             }
@@ -352,7 +371,7 @@ mod tests {
         submit(&mut app, &handle).await.expect("submit should work");
 
         assert!(
-            matches!(rx.try_recv(), Ok(AgentCommand::Skill { name, request })
+            matches!(rx.try_recv(), Ok(AgentCommand::Skill { name, request, .. })
                 if name == "teach" && request.is_empty())
         );
     }
@@ -365,7 +384,7 @@ mod tests {
         submit(&mut app, &handle).await.expect("submit should work");
 
         assert!(
-            matches!(rx.try_recv(), Ok(AgentCommand::Prompt(text))
+            matches!(rx.try_recv(), Ok(AgentCommand::Prompt { text, .. })
                 if text == "/nosuchskill do a thing"),
             "an unknown command must not silently do nothing"
         );
@@ -380,7 +399,7 @@ mod tests {
 
         assert!(!app.should_quit, "only an exact command quits");
         assert!(
-            matches!(rx.try_recv(), Ok(AgentCommand::Prompt(text)) if text == "/exitplan the migration")
+            matches!(rx.try_recv(), Ok(AgentCommand::Prompt { text, .. }) if text == "/exitplan the migration")
         );
     }
 }

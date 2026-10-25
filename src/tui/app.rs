@@ -316,10 +316,14 @@ impl App {
     /// Fold one agent event into the state.
     pub fn apply_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::Started => {
+            AgentEvent::Started { .. } => {
                 self.busy = true;
                 self.status = Status::Generating;
             }
+            AgentEvent::Queued { text, depth } => {
+                self.push(Role::System, format!("queued ({depth}): {text}"));
+            }
+            AgentEvent::Accepted { text } => self.push(Role::User, text),
             AgentEvent::Delta(delta) => {
                 self.status = Status::Generating;
                 self.push_delta(&delta);
@@ -454,9 +458,28 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_message_is_announced_and_an_office_prompt_is_echoed() {
+        let mut app = app();
+        app.apply_event(AgentEvent::Queued {
+            text: "later".into(),
+            depth: 1,
+        });
+        assert!(app.entries.last().expect("entry").text.contains("later"));
+
+        app.apply_event(AgentEvent::Accepted {
+            text: "from the room".into(),
+        });
+        let last = app.entries.last().expect("entry");
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.text, "from the room");
+    }
+
+    #[test]
     fn a_turn_starts_busy_and_ends_idle() {
         let mut app = app();
-        app.apply_event(AgentEvent::Started);
+        app.apply_event(AgentEvent::Started {
+            prompt: "hello".into(),
+        });
         assert!(app.busy);
         assert_eq!(app.status, Status::Generating);
 
@@ -477,7 +500,9 @@ mod tests {
     fn a_non_streaming_turn_still_shows_its_answer() {
         let mut app = app();
         app.push(Role::User, "/json hello");
-        app.apply_event(AgentEvent::Started);
+        app.apply_event(AgentEvent::Started {
+            prompt: "hello".into(),
+        });
         app.apply_event(AgentEvent::Completed {
             text: "{\n  \"title\": \"Hi\"\n}".into(),
         });
@@ -490,7 +515,9 @@ mod tests {
     #[test]
     fn a_failure_is_reported_and_clears_busy() {
         let mut app = app();
-        app.apply_event(AgentEvent::Started);
+        app.apply_event(AgentEvent::Started {
+            prompt: "hello".into(),
+        });
         app.apply_event(AgentEvent::Failed("no credentials".into()));
 
         assert!(!app.busy);

@@ -4,7 +4,8 @@
 //! reads [`AgentEvent`]s back over channels, so rendering never blocks on the
 //! model and the model never touches the terminal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -67,16 +68,30 @@ impl AnswerCard {
     }
 }
 
+/// Where a command came from. The terminal already echoed its own input; the
+/// office has to be echoed by the agent task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Tui,
+    // Wired up with the office in a later task; nothing constructs it yet.
+    #[allow(dead_code)]
+    Office,
+}
+
 /// What the TUI asks the agent to do.
 #[derive(Debug)]
 pub enum AgentCommand {
-    /// Answer `prompt` as streamed prose.
-    Prompt(String),
-    /// Answer `prompt` as a JSON [`AnswerCard`].
-    Structured(String),
+    /// Answer `text` as streamed prose.
+    Prompt { text: String, origin: Origin },
+    /// Answer `text` as a JSON [`AnswerCard`].
+    Structured { text: String, origin: Origin },
     /// Run the skill named `name`, with `request` as what the user wants from
     /// it. The body is read by the agent task, which owns the library.
-    Skill { name: String, request: String },
+    Skill {
+        name: String,
+        request: String,
+        origin: Origin,
+    },
     /// Forget the conversation so far.
     Reset,
 }
@@ -84,8 +99,17 @@ pub enum AgentCommand {
 /// What the agent reports back while working.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    /// A turn has begun.
-    Started,
+    /// A turn has begun, carrying the display line for it.
+    Started {
+        // Mapped to the office's turn event in a later task; the TUI ignores it.
+        #[allow(dead_code)]
+        prompt: String,
+    },
+    /// A command arrived mid-turn and is waiting; `depth` includes it.
+    Queued { text: String, depth: usize },
+    /// A prompt that did not come from this TUI, echoed so the terminal shows
+    /// the question above the answer.
+    Accepted { text: String },
     /// A fragment of assistant text.
     Delta(String),
     /// The model called a tool.
@@ -294,47 +318,73 @@ struct AgentTask {
 
 impl AgentTask {
     /// Serve commands until the TUI drops its handle.
+    ///
+    /// Commands that arrive while a turn runs are queued, not dropped, and the
+    /// turn keeps streaming; the queue is served afterwards.
     async fn run(mut self, mut commands: mpsc::Receiver<AgentCommand>, events: EventSink) {
-        while let Some(command) = commands.recv().await {
-            match command {
-                AgentCommand::Reset => {
-                    self.history.clear();
-                    let _ = events
-                        .send(AgentEvent::Notice("conversation cleared".into()))
-                        .await;
+        let mut queue = VecDeque::new();
+        loop {
+            let command = match queue.pop_front() {
+                Some(command) => command,
+                None => match commands.recv().await {
+                    Some(command) => command,
+                    None => return,
+                },
+            };
+            if !self
+                .execute(command, &mut queue, &mut commands, &events)
+                .await
+            {
+                return;
+            }
+        }
+    }
+
+    /// Run one command. Returns `false` once the primary listener is gone.
+    async fn execute(
+        &mut self,
+        command: AgentCommand,
+        queue: &mut VecDeque<AgentCommand>,
+        commands: &mut mpsc::Receiver<AgentCommand>,
+        events: &EventSink,
+    ) -> bool {
+        match command {
+            AgentCommand::Reset => {
+                self.history.clear();
+                events
+                    .send(AgentEvent::Notice("conversation cleared".into()))
+                    .await
+                    .is_ok()
+            }
+            AgentCommand::Prompt { text, origin } => {
+                if !announce(events, &text, origin).await {
+                    return false;
                 }
-                AgentCommand::Prompt(prompt) => {
-                    if events.send(AgentEvent::Started).await.is_err() {
-                        return;
-                    }
-                    let event = self.stream_turn(&prompt, &events).await;
-                    if events.send(event).await.is_err() {
-                        return;
-                    }
+                drive_turn(self.stream_turn(&text, events), queue, commands, events).await
+            }
+            AgentCommand::Structured { text, origin } => {
+                if !announce(events, &format!("/json {text}"), origin).await {
+                    return false;
                 }
-                AgentCommand::Structured(prompt) => {
-                    if events.send(AgentEvent::Started).await.is_err() {
-                        return;
-                    }
-                    let event = self.structured_turn(&prompt, &events).await;
-                    if events.send(event).await.is_err() {
-                        return;
-                    }
+                drive_turn(self.structured_turn(&text, events), queue, commands, events).await
+            }
+            AgentCommand::Skill {
+                name,
+                request,
+                origin,
+            } => {
+                if !announce(events, &skill_line(&name, &request), origin).await {
+                    return false;
                 }
-                AgentCommand::Skill { name, request } => {
-                    if events.send(AgentEvent::Started).await.is_err() {
-                        return;
+                match self.skills.body(&name) {
+                    Ok(body) => {
+                        let prompt = skill_prompt(&body, &request);
+                        drive_turn(self.stream_turn(&prompt, events), queue, commands, events).await
                     }
-                    let event = match self.skills.body(&name) {
-                        Ok(body) => {
-                            let prompt = skill_prompt(&body, &request);
-                            self.stream_turn(&prompt, &events).await
-                        }
-                        Err(err) => AgentEvent::Failed(err.to_string()),
-                    };
-                    if events.send(event).await.is_err() {
-                        return;
-                    }
+                    Err(err) => events
+                        .send(AgentEvent::Failed(err.to_string()))
+                        .await
+                        .is_ok(),
                 }
             }
         }
@@ -455,6 +505,89 @@ impl AgentTask {
             Err(err) => AgentEvent::Failed(err.to_string()),
         }
     }
+}
+
+/// The line a command shows when it is announced.
+fn display_line(command: &AgentCommand) -> String {
+    match command {
+        AgentCommand::Prompt { text, .. } => text.clone(),
+        AgentCommand::Structured { text, .. } => format!("/json {text}"),
+        AgentCommand::Skill { name, request, .. } => skill_line(name, request),
+        AgentCommand::Reset => "/clear".into(),
+    }
+}
+
+/// `/<name> <request>`, without the trailing space of a bare invocation.
+fn skill_line(name: &str, request: &str) -> String {
+    if request.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("/{name} {request}")
+    }
+}
+
+/// Announce a turn: `Accepted` first for the office, then `Started`.
+///
+/// The textual prompt keeps a skill body off the wire. Returns `false` once
+/// the primary listener is gone.
+async fn announce(events: &EventSink, label: &str, origin: Origin) -> bool {
+    if origin == Origin::Office
+        && events
+            .send(AgentEvent::Accepted {
+                text: label.to_string(),
+            })
+            .await
+            .is_err()
+    {
+        return false;
+    }
+    events
+        .send(AgentEvent::Started {
+            prompt: label.to_string(),
+        })
+        .await
+        .is_ok()
+}
+
+/// Drive one turn to completion while accepting commands that arrive mid-turn.
+///
+/// The select arm touches only the queue, the sink and `closed`; the turn keeps
+/// owning `self`. A closed command channel disables that arm instead of
+/// spinning on `None`. Returns `false` once the primary listener is gone.
+async fn drive_turn<F>(
+    turn: F,
+    queue: &mut VecDeque<AgentCommand>,
+    commands: &mut mpsc::Receiver<AgentCommand>,
+    events: &EventSink,
+) -> bool
+where
+    F: Future<Output = AgentEvent>,
+{
+    tokio::pin!(turn);
+    let mut closed = false;
+    let event = loop {
+        tokio::select! {
+            event = &mut turn => break event,
+            command = commands.recv(), if !closed => match command {
+                Some(command) => {
+                    let text = display_line(&command);
+                    queue.push_back(command);
+                    if events
+                        .send(AgentEvent::Queued {
+                            text,
+                            depth: queue.len(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                None => closed = true,
+            },
+        }
+    };
+    events.send(event).await.is_ok()
 }
 
 /// The turn a `/skill` invocation sends.
@@ -599,11 +732,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_command_arriving_mid_turn_is_queued_and_the_turn_finishes() {
+        let (command_tx, mut commands) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let events = EventSink::new(event_tx);
+        let mut queue = VecDeque::new();
+
+        command_tx
+            .send(AgentCommand::Prompt {
+                text: "second".into(),
+                origin: Origin::Tui,
+            })
+            .await
+            .expect("queue a command");
+
+        // Yielding once leaves the turn pending while the command is ready.
+        let turn = async {
+            tokio::task::yield_now().await;
+            AgentEvent::Completed {
+                text: "first".into(),
+            }
+        };
+        assert!(announce(&events, "first", Origin::Tui).await);
+        let ok = drive_turn(turn, &mut queue, &mut commands, &events).await;
+
+        assert!(ok, "the turn completed");
+        assert_eq!(queue.len(), 1, "the arriving command waits its turn");
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::Started { prompt }) if prompt == "first"
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::Queued { text, depth: 1 }) if text == "second"
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::Completed { text }) if text == "first"
+        ));
+    }
+
+    #[tokio::test]
     async fn the_primary_receives_every_event() {
         let (tx, mut rx) = mpsc::channel(4);
         let sink = EventSink::new(tx);
-        sink.send(AgentEvent::Started).await.expect("send");
-        assert!(matches!(rx.recv().await, Some(AgentEvent::Started)));
+        sink.send(AgentEvent::Started {
+            prompt: "hello".into(),
+        })
+        .await
+        .expect("send");
+        assert!(matches!(
+            rx.recv().await,
+            Some(AgentEvent::Started { prompt }) if prompt == "hello"
+        ));
     }
 
     #[tokio::test]
@@ -618,9 +799,11 @@ mod tests {
                 .expect("a stalled office must not stall the agent");
         }
         drop(extra_rx);
-        sink.send(AgentEvent::Started)
-            .await
-            .expect("a dead office is not an error");
+        sink.send(AgentEvent::Started {
+            prompt: "still here".into(),
+        })
+        .await
+        .expect("a dead office is not an error");
         assert!(
             rx.recv().await.is_some(),
             "the TUI keeps receiving after the office is gone"
