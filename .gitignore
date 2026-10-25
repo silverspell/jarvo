@@ -5,3 +5,10 @@
 
 # CodeGraph local index
 .codegraph/
+
+# Archify candidates and the receipts its gates write next to a diagram
+.archify/
+docs/*.finalize.json
+docs/*.finalize-summary.json
+docs/*.browser-check.json
+docs/*.delivery.json

@@ -27,6 +27,10 @@ back into the conversation. The gauge at the right of the footer tracks how
 full the context window is. Regenerate the recording with `vhs docs/demo.tape`
 — it drives the real binary and makes real model calls.
 
+`docs/jarvo-architecture.html` is a standalone overview of how the pieces fit
+together, generated from the source with [archify](https://github.com/tt-a1i/archify);
+open it in a browser.
+
 ## Requirements
 
 - A Rust toolchain supporting edition 2024. No MSRV is declared in
