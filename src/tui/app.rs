@@ -348,10 +348,14 @@ impl App {
                 self.push_delta(&delta);
             }
             AgentEvent::ToolCall { name } => {
+                // The narration so far ends here; anything after the tool is a
+                // new assistant entry, below the tool log.
+                self.draft = None;
                 self.status = Status::Tool(name.clone());
                 self.push(Role::System, format!("→ {name}"));
             }
             AgentEvent::ToolResult { name } => {
+                self.draft = None;
                 self.status = Status::Generating;
                 self.push(Role::System, format!("← {name}"));
             }
@@ -551,6 +555,48 @@ mod tests {
             .map(|entry| entry.text.as_str())
             .collect();
         assert_eq!(answers, ["done"]);
+    }
+
+    #[test]
+    fn a_tool_call_splits_the_narration_from_the_answer() {
+        let mut app = app();
+        app.apply_event(AgentEvent::Started { prompt: "q".into() });
+        app.apply_event(AgentEvent::Delta("I'll check".into()));
+        app.apply_event(AgentEvent::ToolCall {
+            name: "get_current_time".into(),
+        });
+        app.apply_event(AgentEvent::ToolResult {
+            name: "get_current_time".into(),
+        });
+        app.apply_event(AgentEvent::Delta("It's X".into()));
+        app.apply_event(AgentEvent::Completed {
+            text: "It's X".into(),
+        });
+
+        let entries: Vec<(Role, &str)> = app
+            .entries
+            .iter()
+            .map(|entry| (entry.role, entry.text.as_str()))
+            .collect();
+        let answers: Vec<&str> = entries
+            .iter()
+            .filter(|(role, _)| *role == Role::Assistant)
+            .map(|(_, text)| *text)
+            .collect();
+        assert_eq!(answers, ["I'll check", "It's X"]);
+
+        let position = |text: &str| {
+            entries
+                .iter()
+                .position(|(_, entry)| *entry == text)
+                .unwrap_or_else(|| panic!("missing entry: {text}"))
+        };
+        assert!(
+            position("I'll check") < position("→ get_current_time")
+                && position("→ get_current_time") < position("← get_current_time")
+                && position("← get_current_time") < position("It's X"),
+            "the tool lines sit between the narration and the answer: {entries:?}"
+        );
     }
 
     #[test]
