@@ -36,6 +36,8 @@ anyhow = "1"
 # the crate's default features do not include one.
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 rand = "0.10.3"
+axum = { version = "0.8.9", features = ["ws"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

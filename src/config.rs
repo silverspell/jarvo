@@ -295,7 +295,7 @@ fn any_path(raw: &str) -> Result<PathBuf, std::convert::Infallible> {
 /// Clap hands back `Some("")` for an environment variable that is present but
 /// empty, which `RIGAGENT_SHELL_DIR=` in a `.env` produces. That means "off",
 /// not a directory named "", exactly as a blank `--model` means "default".
-fn non_empty_path(path: Option<PathBuf>) -> Option<PathBuf> {
+pub(crate) fn non_empty_path(path: Option<PathBuf>) -> Option<PathBuf> {
     path.filter(|path| !path.as_os_str().is_empty())
 }
 
@@ -303,7 +303,7 @@ fn non_empty_path(path: Option<PathBuf>) -> Option<PathBuf> {
 ///
 /// `RIGAGENT_OFFICE_BIND=` in a `.env` arrives as an empty string, which is
 /// not a `SocketAddr`; the server should pick localhost on a free port then.
-fn office_bind_or_default(raw: String) -> String {
+pub(crate) fn office_bind_or_default(raw: String) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
         DEFAULT_OFFICE_BIND.to_string()

@@ -23,7 +23,19 @@ async fn main() -> Result<()> {
     config::load_dotenv()?;
     init_tracing();
 
-    let config = Config::resolve(Cli::parse())?;
+    let cli = Cli::parse();
+
+    // The server is its own process: it needs no provider, model or API key.
+    if let Some(dir) = config::non_empty_path(cli.serve_office.clone()) {
+        let bind = config::office_bind_or_default(cli.office_bind.clone());
+        if let Err(err) = office::server::serve(&dir, &bind).await {
+            eprintln!("rigagent: {err:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let config = Config::resolve(cli)?;
     tracing::info!(provider = config.provider.label(), model = %config.model, "starting");
 
     // `tui::run` restores the terminal before returning, so an error here can
