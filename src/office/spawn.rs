@@ -22,11 +22,21 @@ pub fn tmux_command(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> Vec<Strin
     ]
 }
 
+/// The tmux invocation for a spawned Jarvo, with the shell door closed.
+fn spawn_command(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> Command {
+    let argv = tmux_command(exe, dir, cwd, name);
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    // dotenvy never overrides an already-set variable, so a blank value here
+    // beats both an inherited setting and any `.env` in the room-chosen cwd.
+    command.env("RIGAGENT_SHELL_DIR", "");
+    command
+}
+
 /// Run tmux without a shell and report its stderr if it cannot start.
 pub fn spawn(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> io::Result<()> {
     require_directory(cwd)?;
-    let argv = tmux_command(exe, dir, cwd, name);
-    let output = Command::new(&argv[0]).args(&argv[1..]).output()?;
+    let output = spawn_command(exe, dir, cwd, name).output()?;
     if output.status.success() {
         return Ok(());
     }
@@ -119,6 +129,24 @@ mod tests {
             session_name("::"),
             "agent",
             "a name with no safe characters"
+        );
+    }
+
+    #[test]
+    fn the_spawned_agent_cannot_get_a_shell_from_the_environment() {
+        let command = spawn_command(
+            Path::new("/usr/local/bin/rigagent"),
+            Path::new("/home/me/.jarvo/office"),
+            Path::new("/home/me/code/api"),
+            "api",
+        );
+        let (_, shell) = command
+            .get_envs()
+            .find(|(key, _)| key.to_string_lossy() == "RIGAGENT_SHELL_DIR")
+            .expect("the child environment pins RIGAGENT_SHELL_DIR");
+        assert!(
+            shell.is_some_and(|value| value.is_empty()),
+            "an empty RIGAGENT_SHELL_DIR turns the shell off: {shell:?}"
         );
     }
 
