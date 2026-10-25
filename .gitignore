@@ -15,3 +15,11 @@ docs/*.delivery.json
 
 # Brainstorming companion scratch
 .superpowers/
+
+# The office's registration and signing key, written where --office-dir
+# points, which is usually right here. office.json carries the bearer token
+# and office.key is the 32 bytes that sign it; the remote is public.
+office.json
+office.json.tmp-*
+office.key
+office.lock
