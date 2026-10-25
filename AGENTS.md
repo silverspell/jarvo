@@ -78,13 +78,15 @@ Keep rendering and key handling off the model's path.
 
 **The office never slows the agent or the TUI.** Its event channel is lossy on
 purpose: `EventSink::send` awaits the TUI but `try_send`s the office, so a full
-or dead office channel drops frames instead of a delta. The connection is
+or dead office channel drops only the office's copy of an event — deltas
+included — while the TUI still receives it. The connection is
 opt-in, and every failure to join — an unusable directory, a server that will
 not start, a refused connection — is a note in the conversation, never a
 startup failure or a stalled turn. A socket that drops after joining ends
-silently; nothing retries it. The one wait is the startup handshake, bounded at
+silently; nothing retries it. The one wait is registration polling, bounded at
 five seconds for a freshly spawned server and over before the TUI opens;
-nothing on the turn or key path waits on the office. Never log the bearer
+`connect_async` and the Hello send are not separately timed. Nothing on the
+turn or key path waits on the office. Never log the bearer
 token: it lives in the registration file (mode `0600`) and in the page URL, and
 error messages name the port, not the token. The server itself prints the URL
 on stdout only when run as `--serve-office`; an auto-started server's output is

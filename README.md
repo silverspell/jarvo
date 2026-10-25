@@ -418,14 +418,14 @@ server, and joins; every later Jarvo pointed at the same directory joins the
 running server. `--office-name` / `RIGAGENT_OFFICE_NAME` is the name the room
 shows, defaulting to the working directory's name (a duplicate gets `-2`,
 `-3`, …). `--office-bind` / `RIGAGENT_OFFICE_BIND` is where the server listens
-and defaults to `127.0.0.1:0` — localhost on any free port. It is the one
-option that makes the office reachable from another machine:
-`--office-bind 0.0.0.0:8080` opens it to the network.
+and defaults to `127.0.0.1:0` — localhost on any free port. It matters only on
+the Jarvo that starts the server; on a later Jarvo it is inert, because that
+process joins the existing registration. It is the one option that makes the
+office reachable from another machine: `--office-bind 0.0.0.0:8080` opens it to
+the network.
 
 The URL, token included, appears as a note in the conversation of each Jarvo
-that joins, including the one that started the server. A server you run by
-hand prints it on stdout; an auto-started server's output is discarded, so it
-cannot corrupt a TUI.
+that joins, including the one that started the server.
 
 ### What it exposes
 
@@ -459,11 +459,18 @@ installed.
 An agent started from the room gets **no shell**: the spawn explicitly clears
 `RIGAGENT_SHELL_DIR` in the pane command, so a shell directory in the server's
 environment cannot reach it. It starts with only `--office-dir` and
-`--office-name`; provider, model and credentials come from the environment it
-inherits — the office server inherits the environment of the Jarvo that
-started it — or from the chosen directory's `.env`, for variables not already
-set. Flags on the starting Jarvo are not inherited. Set `RIGAGENT_PROVIDER`,
-`RIGAGENT_MODEL` and the matching key if the defaults are not what you want.
+`--office-name`; provider, model and credentials must come from the pane's
+environment or the chosen directory's `.env`. Do not rely on the server's
+environment reaching the pane: `tmux new-session` gives it the tmux server's
+global environment plus only the variables on tmux's `update-environment` list
+copied from the client, and the `RIGAGENT_*` provider variables are not on it.
+If a tmux server is already running from an environment without them, the pane
+may not see `RIGAGENT_PROVIDER`, `RIGAGENT_MODEL`, or the API key at all; the
+spawn still succeeds, but the child can exit before it joins and the room gets
+no note. The chosen directory's `.env` is the reliable place for these
+settings, for variables the pane does not already have. Flags on the starting
+Jarvo are not inherited either. Set `RIGAGENT_PROVIDER`, `RIGAGENT_MODEL` and
+the matching key there if the defaults are not what you want.
 
 ### When it is broken
 
@@ -478,8 +485,9 @@ not retried.
 Limitations, plainly:
 
 - **No reconnect.** If the office server dies, the room is gone; the page shows
-  a banner and has to be reloaded after a restart. A Jarvo that loses its
-  socket does not retry either.
+  a banner. With the default `127.0.0.1:0` a restart usually publishes a new
+  port, so reopen the new tokenised URL from the new note rather than
+  reloading the old page. A Jarvo that loses its socket does not retry either.
 - **The starter's lock outlives the server.** While the Jarvo that started the
   office is still running, its lock prevents another Jarvo from reclaiming the
   directory, so a dead server stays dead. Quit that Jarvo, or clear the office
