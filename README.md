@@ -400,6 +400,97 @@ the tool runs. Against a 500-turn cap that is worth thinking about. Use a low
 `--max-turns` while finding your feet, and set `"enabled": false` when you are
 not using the server.
 
+## Office (optional)
+
+The office puts several live Jarvos in one web page. Each appears as a
+character in a room; click one to watch its transcript fill in as it works and
+to type into its command box. A command sent to an agent that is busy is
+queued, not dropped, and runs when the current turn ends.
+
+Turn it on by naming a directory for the office's state:
+
+```bash
+cargo run -- --office-dir ~/.jarvo/office      # or RIGAGENT_OFFICE_DIR
+```
+
+The first Jarvo started with an office directory claims it, starts the office
+server, and joins; every later Jarvo pointed at the same directory joins the
+running server. `--office-name` / `RIGAGENT_OFFICE_NAME` is the name the room
+shows, defaulting to the working directory's name (a duplicate gets `-2`,
+`-3`, …). `--office-bind` / `RIGAGENT_OFFICE_BIND` is where the server listens
+and defaults to `127.0.0.1:0` — localhost on any free port. It is the one
+option that makes the office reachable from another machine:
+`--office-bind 0.0.0.0:8080` opens it to the network.
+
+The URL, token included, appears as a note in the conversation of each Jarvo
+that joins, including the one that started the server. A server you run by
+hand prints it on stdout; an auto-started server's output is discarded, so it
+cannot corrupt a TUI.
+
+### What it exposes
+
+**Anyone who can open the office can drive every agent in it.** The bearer
+token is the only gate: it is a full-control credential, and a command from
+the room runs with all the tools that agent carries, MCP tools included. An
+agent started with `--shell-dir` will run shell commands for anyone in the
+room, without confirmation.
+
+**Exposing the port sends the bearer token and every conversation in
+cleartext.** The office speaks plain HTTP and WebSocket, not TLS. Do not bind
+it to a public address as-is; put it behind a reverse proxy that terminates
+TLS, or reach it through an SSH tunnel. There are no cookies; the page keeps
+the token in `localStorage`.
+
+### Agents started from the room
+
+The `+ Agent` button asks for a directory and an optional name, then starts a
+Jarvo there in a tmux session called `jarvo-<name>` (names with spaces or
+punctuation are sanitized for tmux). From another shell you can then attach:
+
+```bash
+ssh the-host
+tmux attach -t jarvo-<name>
+```
+
+tmux must be installed on the host. The spawn path is covered by unit tests
+but has not been exercised live on this development host, which has no tmux
+installed.
+
+An agent started from the room gets **no shell**: the spawn explicitly clears
+`RIGAGENT_SHELL_DIR` in the pane command, so a shell directory in the server's
+environment cannot reach it. It starts with only `--office-dir` and
+`--office-name`; provider, model and credentials come from the environment it
+inherits — the office server inherits the environment of the Jarvo that
+started it — or from the chosen directory's `.env`, for variables not already
+set. Flags on the starting Jarvo are not inherited. Set `RIGAGENT_PROVIDER`,
+`RIGAGENT_MODEL` and the matching key if the defaults are not what you want.
+
+### When it is broken
+
+The office is optional. No directory, no office. If the directory cannot be
+used, the server cannot start, or the first connection cannot be made, the
+conversation gets one note saying so and the agent runs normally — it is never
+a startup failure and never blocks a turn. A newly started server gets up to
+five seconds to publish its registration, and that wait happens before the TUI
+opens. Once joined, a socket that drops is silent rather than a note, and it is
+not retried.
+
+Limitations, plainly:
+
+- **No reconnect.** If the office server dies, the room is gone; the page shows
+  a banner and has to be reloaded after a restart. A Jarvo that loses its
+  socket does not retry either.
+- **The starter's lock outlives the server.** While the Jarvo that started the
+  office is still running, its lock prevents another Jarvo from reclaiming the
+  directory, so a dead server stays dead. Quit that Jarvo, or clear the office
+  directory, before starting a new one.
+- **No durable history.** The room keeps the latest 200 events per agent in
+  memory so a browser arriving late can catch up; nothing is written down.
+- **One office per directory**, with one bearer token — meant for one user on
+  one machine, not for sharing between people.
+- **No steering a turn in flight.** A command sent mid-turn queues behind it.
+  `/clear` and `/quit` are local to the agent and are refused from the room.
+
 ## Voice input
 
 No code here handles audio. Dictation works because the operating system types
@@ -470,6 +561,15 @@ src/
 ├── tools.rs       native tool implementations
 ├── docs.rs        skill library and the read_skill tool
 ├── mcp.rs         optional MCP client setup
+├── office/
+│   ├── mod.rs     office module tree
+│   ├── protocol.rs wire messages between agents and the room
+│   ├── registry.rs one office per directory, the registration
+│   ├── auth.rs    signing and checking the bearer token
+│   ├── server.rs  routes, roster, agent and browser sockets
+│   ├── client.rs  join or start the office, then keep the socket
+│   ├── spawn.rs   start an agent from the room through tmux
+│   └── web/       the page, script and stylesheet (no build step)
 └── tui/
     ├── mod.rs     terminal lifecycle, input events, main loop
     ├── app.rs     application state
