@@ -15,6 +15,8 @@ const STALE_AFTER: Duration = Duration::from_secs(60);
 // Deliberately not `Debug`: the token must never reach a log line.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Registration {
+    /// The host agents should dial, as advertised by the server.
+    pub host: String,
     pub port: u16,
     pub pid: u32,
     pub token: String,
@@ -206,12 +208,15 @@ mod tests {
     fn a_registration_round_trips() {
         let dir = tempdir();
         let registration = Registration {
+            host: "127.0.0.1".into(),
             port: 7777,
             pid: std::process::id(),
             token: "t".into(),
         };
         publish(dir.path(), &registration).expect("publish");
-        assert_eq!(find(dir.path()).expect("found").port, 7777);
+        let found = find(dir.path()).expect("found");
+        assert_eq!(found.host, "127.0.0.1");
+        assert_eq!(found.port, 7777);
     }
 
     #[test]
@@ -341,6 +346,7 @@ mod tests {
             .expect("a wide old mode");
 
         let registration = Registration {
+            host: "127.0.0.1".into(),
             port: 7777,
             pid: std::process::id(),
             token: "t".into(),
@@ -363,6 +369,7 @@ mod tests {
         let dir = root.path().join("office");
         assert!(claim(&dir).expect("claim"));
         let registration = Registration {
+            host: "127.0.0.1".into(),
             port: 7777,
             pid: std::process::id(),
             token: "t".into(),

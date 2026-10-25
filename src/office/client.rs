@@ -17,6 +17,9 @@ use crate::agent::{AgentCommand, AgentEvent, AgentHandle, Origin};
 
 /// How long a freshly spawned server gets to publish its registration.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the WebSocket connect and Hello may take before the office is
+/// treated as broken and the agent carries on.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the registration is checked while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Events waiting for the socket. `EventSink` drops rather than blocks, so a
@@ -33,43 +36,59 @@ pub async fn join(
     info: AgentInfo,
     handle: AgentHandle,
 ) -> (Option<mpsc::Sender<AgentEvent>>, String) {
-    let registration = match acquire(dir, bind).await {
+    let dir = match super::absolute_dir(dir) {
+        Ok(dir) => dir,
+        Err(err) => {
+            return (
+                None,
+                format!("Office: cannot resolve {} ({err})", dir.display()),
+            );
+        }
+    };
+    let registration = match acquire(&dir, bind).await {
         Ok(registration) => registration,
         Err(problem) => return (None, format!("Office: {problem}")),
     };
 
-    let url = format!(
-        "ws://127.0.0.1:{}/ws/agent?token={}",
-        registration.port, registration.token
-    );
-    let socket = match connect_async(&url).await {
-        Ok((socket, _response)) => socket,
-        Err(err) => {
-            // The URL carries the token, so the problem names only the port.
+    let url = agent_url(&registration);
+    let joined = tokio::time::timeout(JOIN_TIMEOUT, async {
+        let (socket, _response) = connect_async(&url).await.map_err(|err| {
+            // The URL carries the token, so the problem names host and port.
+            format!(
+                "cannot connect to the server on {}:{} ({err})",
+                registration.host, registration.port
+            )
+        })?;
+        let (mut sink, stream) = socket.split();
+        let hello = serde_json::to_string(&FromAgent::Hello { info })
+            .map_err(|_| "cannot encode the hello message".to_string())?;
+        sink.send(Message::Text(hello.into()))
+            .await
+            .map_err(|err| {
+                format!(
+                    "the server on {}:{} closed the connection ({err})",
+                    registration.host, registration.port
+                )
+            })?;
+        Ok::<_, String>((sink, stream))
+    })
+    .await;
+
+    let (mut sink, mut stream) = match joined {
+        Ok(Ok(joined)) => joined,
+        Ok(Err(problem)) => return (None, format!("Office: {problem}")),
+        Err(_) => {
             return (
                 None,
                 format!(
-                    "Office: cannot connect to the server on 127.0.0.1:{} ({err})",
-                    registration.port
+                    "Office: the server on {}:{} did not answer within {} seconds",
+                    registration.host,
+                    registration.port,
+                    JOIN_TIMEOUT.as_secs()
                 ),
             );
         }
     };
-
-    let (mut sink, mut stream) = socket.split();
-    let hello = FromAgent::Hello { info };
-    let Ok(hello) = serde_json::to_string(&hello) else {
-        return (None, "Office: cannot encode the hello message".into());
-    };
-    if let Err(err) = sink.send(Message::Text(hello.into())).await {
-        return (
-            None,
-            format!(
-                "Office: the server on 127.0.0.1:{} closed the connection ({err})",
-                registration.port
-            ),
-        );
-    }
 
     let (events, mut outgoing) = mpsc::channel(EVENT_CAPACITY);
     tokio::spawn(async move {
@@ -101,12 +120,23 @@ pub async fn join(
         }
     });
 
-    (
-        Some(events),
-        format!(
-            "http://127.0.0.1:{}/?token={}",
-            registration.port, registration.token
-        ),
+    (Some(events), room_url(&registration))
+}
+
+/// The agent socket address, using the host the server advertised.
+fn agent_url(registration: &Registration) -> String {
+    format!(
+        "ws://{}:{}/ws/agent?token={}",
+        registration.host, registration.port, registration.token
+    )
+}
+
+/// The room address shown in the conversation. It carries the token and is
+/// never logged.
+fn room_url(registration: &Registration) -> String {
+    format!(
+        "http://{}:{}/?token={}",
+        registration.host, registration.port, registration.token
     )
 }
 
@@ -147,17 +177,30 @@ async fn acquire(dir: &Path, bind: &str) -> Result<Registration, String> {
 fn start_server(dir: &Path, bind: &str) -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|err| format!("cannot find the Jarvo executable ({err})"))?;
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("--serve-office")
         .arg(dir)
         .arg("--office-bind")
         .arg(bind)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    // Its own process group: closing the terminal that started it must not
+    // SIGHUP the office out from under every other Jarvo.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
-        .map(|_child| ())
-        .map_err(|err| format!("cannot start the server ({err})"))
+        .map_err(|err| format!("cannot start the server ({err})"))?;
+    // Reap it off the async task so it does not linger as a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// Turn one agent event into a wire frame, assigning it to the current turn.
@@ -240,6 +283,62 @@ mod tests {
         assert!(
             note.to_lowercase().contains("office"),
             "the note names the problem: {note}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_never_answers_is_a_note_not_a_hang() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let port = listener.local_addr().expect("address").port();
+        tokio::spawn(async move {
+            // Accept and never complete the WebSocket handshake.
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                held.push(socket);
+            }
+        });
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let registration = Registration {
+            host: "127.0.0.1".into(),
+            port,
+            pid: std::process::id(),
+            token: "t".into(),
+        };
+        registry::publish(dir.path(), &registration).expect("publish");
+        assert!(
+            registry::find(dir.path()).is_some(),
+            "the registration looks live"
+        );
+
+        let (sink, note) = join(dir.path(), "127.0.0.1:0", test_info(), test_handle().0).await;
+        assert!(sink.is_none(), "a wedged office is not joined");
+        assert!(
+            note.contains("did not answer"),
+            "the note names the timeout: {note}"
+        );
+    }
+
+    #[test]
+    fn the_urls_use_the_advertised_host() {
+        let registration = Registration {
+            host: "192.168.1.10".into(),
+            port: 8080,
+            pid: 1,
+            token: "token".into(),
+        };
+        assert_eq!(
+            agent_url(&registration),
+            "ws://192.168.1.10:8080/ws/agent?token=token"
+        );
+        assert_eq!(
+            room_url(&registration),
+            "http://192.168.1.10:8080/?token=token"
         );
     }
 

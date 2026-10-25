@@ -19,8 +19,8 @@ pub fn tmux_command(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> Vec<Strin
         exe.to_string_lossy().into_owned(),
         "--office-dir".into(),
         dir.to_string_lossy().into_owned(),
-        "--office-name".into(),
-        name.into(),
+        // One token: a name starting with `-` must never look like a flag.
+        format!("--office-name={name}"),
     ]
 }
 
@@ -89,8 +89,7 @@ mod tests {
         assert!(argv.windows(2).any(|w| w[0] == "-s" && w[1] == "jarvo-api"));
         assert!(argv.iter().any(|a| a == "--office-dir"));
         assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--office-name" && w[1] == "api"),
+            argv.iter().any(|a| a == "--office-name=api"),
             "the name chosen in the room reaches the new Jarvo"
         );
         assert!(
@@ -113,14 +112,36 @@ mod tests {
             "tmux only sees a safe session name: {argv:?}"
         );
         assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--office-name" && w[1] == "a b:c"),
+            argv.iter().any(|a| a == "--office-name=a b:c"),
             "the display name reaches the office unchanged: {argv:?}"
         );
         assert_eq!(
             session_name("::"),
             "agent",
             "a name with no safe characters"
+        );
+    }
+
+    #[test]
+    fn a_name_that_looks_like_a_flag_stays_one_argument() {
+        let argv = tmux_command(
+            Path::new("/usr/local/bin/rigagent"),
+            Path::new("/home/me/.jarvo/office"),
+            Path::new("/home/me/code/api"),
+            "-boss",
+        );
+        assert!(
+            argv.iter().any(|a| a == "--office-name=-boss"),
+            "the name rides in one token: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "-boss"),
+            "the name never becomes its own flag: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-s" && w[1] == "jarvo-boss"),
+            "the session name is still safe: {argv:?}"
         );
     }
 

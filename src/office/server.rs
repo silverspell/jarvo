@@ -76,8 +76,10 @@ impl Office {
         let mut room = self.room.lock().await;
         info.name = unique_name(room.names(&info.id.0), &info.name);
         let generation = room.add(info.clone(), outbox);
-        drop(room);
+        // Broadcasting under the lock keeps `Joined` and `Left` in the same
+        // order the room changed, so a close cannot overtake a reconnect.
         self.broadcast(ToBrowser::Joined { info: info.clone() });
+        drop(room);
         (info, generation)
     }
 
@@ -96,7 +98,10 @@ impl Office {
     /// Mark the agent disconnected. `Some` carries the generation the forget
     /// timer must use; `None` means the close came from a replaced socket.
     async fn agent_gone(&self, id: &AgentId, generation: u64) -> Option<u64> {
-        self.room.lock().await.gone(&id.0, generation)
+        let mut room = self.room.lock().await;
+        let fresh = room.gone(&id.0, generation)?;
+        self.broadcast(ToBrowser::Left { id: id.clone() });
+        Some(fresh)
     }
 }
 
@@ -164,6 +169,25 @@ impl Room {
             .values()
             .map(|agent| agent.info.clone())
             .collect()
+    }
+
+    /// The frames a browser needs on arrival: the roster, then a `Left` for
+    /// every agent that has already closed. Without the second frame a page
+    /// opened during the grace period would show a departed agent as live and
+    /// never start its removal timer.
+    fn welcome(&self) -> Vec<ToBrowser> {
+        let mut messages = vec![ToBrowser::Roster {
+            agents: self.roster(),
+        }];
+        messages.extend(
+            self.agents
+                .values()
+                .filter(|agent| !agent.connected)
+                .map(|agent| ToBrowser::Left {
+                    id: agent.info.id.clone(),
+                }),
+        );
+        messages
     }
 
     /// Mark the connection behind `generation` disconnected, returning the
@@ -412,9 +436,11 @@ async fn send_json<T: Serialize>(socket: &mut WebSocket, message: &T) -> bool {
 
 async fn browser_socket(mut socket: WebSocket, state: Office) {
     let mut events = state.browsers.subscribe();
-    let roster = state.roster().await;
-    if !send_json(&mut socket, &ToBrowser::Roster { agents: roster }).await {
-        return;
+    let welcome = state.room.lock().await.welcome();
+    for message in &welcome {
+        if !send_json(&mut socket, message).await {
+            return;
+        }
     }
 
     loop {
@@ -490,7 +516,6 @@ async fn agent_socket(mut socket: WebSocket, state: Office) {
     if let Some((id, generation)) = connection
         && let Some(generation) = state.agent_gone(&id, generation).await
     {
-        state.broadcast(ToBrowser::Left { id: id.clone() });
         tokio::spawn(forget_after(
             state.room.clone(),
             id,
@@ -505,6 +530,8 @@ async fn agent_socket(mut socket: WebSocket, state: Office) {
 /// This is the only place the process prints: it is its own process, and the
 /// URL carries the token, so it is printed rather than logged.
 pub async fn serve(dir: &Path, bind: &str) -> Result<()> {
+    let dir = super::absolute_dir(dir)
+        .with_context(|| format!("cannot resolve the office directory {}", dir.display()))?;
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("`{bind}` is not a socket address"))?;
@@ -514,25 +541,44 @@ pub async fn serve(dir: &Path, bind: &str) -> Result<()> {
     let bound = listener
         .local_addr()
         .context("cannot read the office address")?;
+    let host = advertised_host(bound);
 
-    let key = auth::load_or_create_key(dir)
+    let key = auth::load_or_create_key(&dir)
         .with_context(|| format!("cannot load the office key in {}", dir.display()))?;
     let token = auth::issue(&key, "office").context("cannot issue the office token")?;
-    let state = Office::new(key, dir);
+    let state = Office::new(key, dir.clone());
 
     let registration = Registration {
+        host: host.clone(),
         port: bound.port(),
         pid: std::process::id(),
         token: token.clone(),
     };
-    registry::publish(dir, &registration)
+    registry::publish(&dir, &registration)
         .with_context(|| format!("cannot write the office registration in {}", dir.display()))?;
 
-    println!("Jarvo office: http://{bound}/?token={token}");
+    println!(
+        "Jarvo office: http://{host}:{}/?token={token}",
+        bound.port()
+    );
     axum::serve(listener, router(state))
         .await
         .context("the office server stopped")?;
     Ok(())
+}
+
+/// The host agents and the room should dial. A wildcard bind is not an address
+/// a browser can use, so it advertises loopback; anything else advertises the
+/// bound IP, bracketed when IPv6 so it forms a URL.
+fn advertised_host(addr: SocketAddr) -> String {
+    let ip = addr.ip();
+    if ip.is_unspecified() {
+        "127.0.0.1".into()
+    } else if ip.is_ipv6() {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -845,16 +891,115 @@ mod tests {
     #[tokio::test]
     async fn a_websocket_route_refuses_a_request_without_a_token() {
         let (app, _) = router_for_tests();
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/ws/browser")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
+        for route in ["/ws/browser", "/ws/agent"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{route} needs a token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_browser_is_told_which_agents_have_left() {
+        let office = Office::new(KEY.to_vec(), Path::new("/tmp"));
+        let (outbox, _inbox) = mpsc::channel(8);
+        let (info, generation) = office.join(agent("a", "bob"), outbox).await;
+        office
+            .agent_gone(&info.id, generation)
             .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            .expect("the socket closed");
+
+        let welcome = office.room.lock().await.welcome();
+        assert_eq!(
+            welcome,
+            vec![
+                ToBrowser::Roster {
+                    agents: vec![info.clone()]
+                },
+                ToBrowser::Left { id: info.id },
+            ],
+            "a page opened during the grace period sees the roster and the departure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_agent_gets_no_bogus_left_on_welcome() {
+        let office = Office::new(KEY.to_vec(), Path::new("/tmp"));
+        let (outbox, _inbox) = mpsc::channel(8);
+        let (info, _) = office.join(agent("a", "bob"), outbox).await;
+
+        let welcome = office.room.lock().await.welcome();
+        assert_eq!(
+            welcome,
+            vec![ToBrowser::Roster { agents: vec![info] }],
+            "only departed agents get a Left"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_before_the_old_socket_closes_stays_live() {
+        let office = Office::new(KEY.to_vec(), Path::new("/tmp"));
+        let mut frames = office.browsers.subscribe();
+
+        let (first_outbox, _first_inbox) = mpsc::channel(8);
+        let (info, stale) = office.join(agent("a", "bob"), first_outbox).await;
+        let (second_outbox, _second_inbox) = mpsc::channel(8);
+        let (_, current) = office.join(info.clone(), second_outbox).await;
+
+        for _ in 0..2 {
+            assert!(
+                matches!(frames.try_recv(), Ok(ToBrowser::Joined { .. })),
+                "each join is announced in order"
+            );
+        }
+
+        assert!(
+            office.agent_gone(&info.id, stale).await.is_none(),
+            "the replaced socket cannot close the live one"
+        );
+        assert!(
+            matches!(
+                frames.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "a stale close must not send Left after the reconnect's Joined"
+        );
+        let room = office.room.lock().await;
+        let agent = &room.agents[&info.id.0];
+        assert!(agent.connected, "the reconnected agent is still live");
+        assert_eq!(agent.generation, current);
+    }
+
+    #[test]
+    fn a_wildcard_bind_advertises_loopback_and_other_binds_advertise_themselves() {
+        assert_eq!(
+            advertised_host("0.0.0.0:8080".parse().expect("addr")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            advertised_host("[::]:8080".parse().expect("addr")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            advertised_host("192.168.1.10:8080".parse().expect("addr")),
+            "192.168.1.10"
+        );
+        assert_eq!(
+            advertised_host("[::1]:8080".parse().expect("addr")),
+            "[::1]",
+            "an IPv6 host stays usable in a URL"
+        );
     }
 
     #[test]

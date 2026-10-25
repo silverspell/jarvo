@@ -415,14 +415,21 @@ cargo run -- --office-dir ~/.jarvo/office      # or RIGAGENT_OFFICE_DIR
 
 The first Jarvo started with an office directory claims it, starts the office
 server, and joins; every later Jarvo pointed at the same directory joins the
-running server. `--office-name` / `RIGAGENT_OFFICE_NAME` is the name the room
-shows, defaulting to the working directory's name (a duplicate gets `-2`,
-`-3`, …). `--office-bind` / `RIGAGENT_OFFICE_BIND` is where the server listens
-and defaults to `127.0.0.1:0` — localhost on any free port. It matters only on
-the Jarvo that starts the server; on a later Jarvo it is inert, because that
+running server. That server runs in its own process group, so closing the
+terminal that happened to start it does not take the office down. An absolute
+`--office-dir` is recommended; a relative one is resolved against the current
+directory by whichever process starts the office, then shared.
+
+`--office-name` / `RIGAGENT_OFFICE_NAME` is the name the room shows,
+defaulting to the working directory's name (a duplicate gets `-2`, `-3`, …).
+`--office-bind` / `RIGAGENT_OFFICE_BIND` is where the server listens and
+defaults to `127.0.0.1:0` — localhost on any free port. It matters only on the
+Jarvo that starts the server; on a later Jarvo it is inert, because that
 process joins the existing registration. It is the one option that makes the
-office reachable from another machine: `--office-bind 0.0.0.0:8080` opens it to
-the network.
+office reachable from another machine: `--office-bind 0.0.0.0:8080` opens it
+to the network. A wildcard bind advertises `127.0.0.1` to joining agents and
+in the room note, because a wildcard is not an address a browser can dial; from
+another machine, open `http://<that machine's address>:8080/?token=…` yourself.
 
 The URL, token included, appears as a note in the conversation of each Jarvo
 that joins, including the one that started the server.

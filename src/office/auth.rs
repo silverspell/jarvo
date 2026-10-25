@@ -49,7 +49,13 @@ pub fn load_or_create_key(dir: &Path) -> io::Result<Vec<u8>> {
     }
     match options.open(&path) {
         Ok(mut file) => {
-            file.write_all(&key)?;
+            if let Err(error) = file.write_all(&key) {
+                // A failed write leaves a short file that every later start
+                // would refuse; remove it so the next start can create a key.
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
             Ok(key.to_vec())
         }
         // Another caller created it first; use theirs rather than overwrite.
@@ -81,6 +87,13 @@ fn read_key(path: &Path) -> io::Result<Vec<u8>> {
     for attempt in 0..=KEY_SETTLE_ATTEMPTS {
         let key = fs::read(path)?;
         if key.len() == KEY_LEN {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Creation is private, but a key written by another tool may
+                // not be; tighten it on load as well as on create.
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            }
             return Ok(key);
         }
         if attempt < KEY_SETTLE_ATTEMPTS {
@@ -150,6 +163,26 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_wide_key_is_tightened_on_load() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("office.key");
+        std::fs::write(&path, [7u8; KEY_LEN]).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("a wide old mode");
+
+        let key = load_or_create_key(dir.path()).expect("load");
+        assert_eq!(key, vec![7u8; KEY_LEN], "the existing key is kept");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "loading tightens the key");
     }
 
     #[test]

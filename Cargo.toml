@@ -42,3 +42,5 @@ tokio-tungstenite = "0.30.0"
 [dev-dependencies]
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+# Paused-time tests prove the office join timeout without waiting five seconds.
+tokio = { version = "1.54.1", features = ["test-util"] }
