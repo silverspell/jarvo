@@ -327,6 +327,41 @@ calls if a run really goes that far. Lower it with `--max-turns` for a session
 where that matters, and remember `Ctrl+C` exits cleanly mid-turn if a run gets
 away from you, and `/exit` and `/bye` do the same from the input line.
 
+### Maestro (configured)
+
+`mcp.json` also starts [Maestro](https://maestro.dev)'s MCP server, which gives
+the agent UI automation on a phone: `list_devices`, `inspect_screen`, `run` (a
+Maestro flow, inline YAML or a file), `take_screenshot`, and the cloud-run
+tools. It drives a connected Android device, an iOS simulator, or Chromium.
+
+The server is the Maestro CLI's own `maestro mcp` subcommand, not an `npx`
+package, so nothing downloads it for you: install Maestro first and keep it on
+`PATH`. Jarvo inherits the `PATH` of the shell it was started from, so if
+`~/.maestro/bin` is not on it, write the full path into `mcp.json`.
+
+The flags are deliberate:
+
+| Flag | Why |
+| --- | --- |
+| no `--viewer-port` | Maestro then takes any free port. Pinning the port looks tidier and is a trap: if something else already holds it — another editor's Maestro MCP server, most likely — the bind fails and the whole server dies, taking the tools with it |
+| `--working-dir` | Where flow files and relative paths resolve from, so a flow can be named `maestro/flows/login.yaml` |
+
+The Maestro Viewer — a live view of the device — is left running on purpose,
+for the same reason the browser runs headed: watching the device is how you
+tell a stuck flow from a slow one. Its address is printed to the server's
+stderr as `mcp_viewer_ready http://127.0.0.1:<port>`, which `src/mcp.rs` sends
+to `tracing`, so set `RIGAGENT_LOG_FILE` if you want to read it; the device
+tools report it too. Add `--no-viewer` to turn it off.
+
+One rough edge: `take_screenshot` returns the image over gRPC and a tall phone
+screen overruns the 4 MB message limit (`RESOURCE_EXHAUSTED`). On a 1080×2340
+device, take the picture with `adb exec-out screencap -p` instead.
+
+**Maestro acts on a real phone.** It taps, types and launches applications on
+whichever device is connected, this application has no approval step, and a tap
+can spend real money. Unplug the device or set `"enabled": false` when you are
+not using it.
+
 ### Remote servers over a bridge (Pally)
 
 `mcp.json` also starts Pally through
