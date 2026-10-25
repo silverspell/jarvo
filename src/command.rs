@@ -73,6 +73,10 @@ mod tests {
         assert!(matches!(parse("/json do it", &skills), Input::Structured(p) if p == "do it"));
         assert!(matches!(parse("/json", &skills), Input::JsonWithoutAPrompt));
         assert!(
+            matches!(parse("/jsonfoo", &skills), Input::Prompt(p) if p == "/jsonfoo"),
+            "only an exact or whitespace-separated /json is a command"
+        );
+        assert!(
             matches!(parse("/teach rust", &skills), Input::Skill { name, .. } if name == "teach")
         );
         assert!(matches!(parse("/clear", &skills), Input::Clear));
