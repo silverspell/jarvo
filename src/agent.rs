@@ -109,6 +109,51 @@ pub struct AgentHandle {
     commands: mpsc::Sender<AgentCommand>,
 }
 
+/// Where agent events go: the TUI first, and optionally a second listener.
+///
+/// The TUI must see every delta, so it gets awaited backpressure. A second
+/// listener, like the office, is lossy by design: a full or closed channel
+/// drops its copy rather than stalling the agent.
+pub struct EventSink {
+    primary: mpsc::Sender<AgentEvent>,
+    extra: Option<mpsc::Sender<AgentEvent>>,
+}
+
+impl EventSink {
+    pub fn new(primary: mpsc::Sender<AgentEvent>) -> Self {
+        Self {
+            primary,
+            extra: None,
+        }
+    }
+
+    /// Add a listener whose events may be dropped.
+    // Wired to the office in a later task; the tests below already exercise it.
+    #[allow(dead_code)]
+    pub fn with_extra(mut self, extra: mpsc::Sender<AgentEvent>) -> Self {
+        self.extra = Some(extra);
+        self
+    }
+
+    /// Deliver `event`, failing only when the primary has stopped listening.
+    pub async fn send(&self, event: AgentEvent) -> Result<(), mpsc::error::SendError<AgentEvent>> {
+        if let Some(extra) = &self.extra {
+            // The extra channel is best-effort: `try_send` keeps a slow or dead
+            // listener from ever blocking the agent or the transcript.
+            match extra.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!("office event dropped: its channel is full")
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!("office event dropped: its channel is closed")
+                }
+            }
+        }
+        self.primary.send(event).await
+    }
+}
+
 impl AgentHandle {
     /// Queue a command for the agent.
     ///
@@ -223,7 +268,7 @@ pub async fn start(config: &Config) -> Result<Started> {
         // as long as the agent exists.
         _mcp: mcp_tools.connections,
     };
-    tokio::spawn(task.run(command_rx, event_tx));
+    tokio::spawn(task.run(command_rx, EventSink::new(event_tx)));
 
     Ok(Started {
         handle: AgentHandle {
@@ -249,11 +294,7 @@ struct AgentTask {
 
 impl AgentTask {
     /// Serve commands until the TUI drops its handle.
-    async fn run(
-        mut self,
-        mut commands: mpsc::Receiver<AgentCommand>,
-        events: mpsc::Sender<AgentEvent>,
-    ) {
+    async fn run(mut self, mut commands: mpsc::Receiver<AgentCommand>, events: EventSink) {
         while let Some(command) = commands.recv().await {
             match command {
                 AgentCommand::Reset => {
@@ -301,7 +342,7 @@ impl AgentTask {
 
     /// One streamed turn: forward deltas and tool activity as they happen, and
     /// commit the turn to the conversation only once it succeeds.
-    async fn stream_turn(&mut self, prompt: &str, events: &mpsc::Sender<AgentEvent>) -> AgentEvent {
+    async fn stream_turn(&mut self, prompt: &str, events: &EventSink) -> AgentEvent {
         let mut stream = self
             .agent
             .prompt(prompt)
@@ -374,11 +415,7 @@ impl AgentTask {
     ///
     /// This is a single turn with the output tool forced, so the agent's own
     /// tools are not available here.
-    async fn structured_turn(
-        &mut self,
-        prompt: &str,
-        events: &mpsc::Sender<AgentEvent>,
-    ) -> AgentEvent {
+    async fn structured_turn(&mut self, prompt: &str, events: &EventSink) -> AgentEvent {
         let response = self
             .extractor
             .extract(prompt)
@@ -558,6 +595,35 @@ mod tests {
         assert_eq!(
             confidence["maximum"], 1.0,
             "schema should bound confidence: {schema}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_primary_receives_every_event() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = EventSink::new(tx);
+        sink.send(AgentEvent::Started).await.expect("send");
+        assert!(matches!(rx.recv().await, Some(AgentEvent::Started)));
+    }
+
+    #[tokio::test]
+    async fn a_full_extra_channel_never_blocks_the_primary() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (extra_tx, extra_rx) = mpsc::channel(1); // capacity 1, never drained
+        let sink = EventSink::new(tx).with_extra(extra_tx);
+
+        for _ in 0..5 {
+            sink.send(AgentEvent::Delta("x".into()))
+                .await
+                .expect("a stalled office must not stall the agent");
+        }
+        drop(extra_rx);
+        sink.send(AgentEvent::Started)
+            .await
+            .expect("a dead office is not an error");
+        assert!(
+            rx.recv().await.is_some(),
+            "the TUI keeps receiving after the office is gone"
         );
     }
 }
