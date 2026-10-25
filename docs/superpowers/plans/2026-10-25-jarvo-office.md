@@ -1,8 +1,9 @@
 # The Office Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
-> superpowers:subagent-driven-development (recommended) or
-> superpowers:executing-plans to implement this plan task-by-task. Steps use
+> superpowers:subagent-driven-development to implement this plan task-by-task —
+> a fresh implementer per task and a fresh reviewer before the next one starts.
+> That method was chosen for this plan, not merely suggested. Steps use
 > checkbox (`- [ ]`) syntax for tracking. Work in order; each task ends with
 > green tests and a commit, and no task starts before the previous one's tests
 > pass.
@@ -40,6 +41,14 @@ first. It explains *why*; this plan says *what*.
   most training data: `ls ~/.cargo/registry/src/*/rig-core-0.45.0/src`. This
   plan touches Rig only where it quotes the existing code verbatim; do not
   invent Rig calls.
+- **This repository is indexed by CodeGraph; use it before grep or reading
+  files.** One `codegraph_explore` call with the names you need
+  (`codegraph_explore "AgentTask AgentEvent EventSink"`, or
+  `codegraph explore "<names>"` in a shell) returns those symbols' current
+  line-numbered source plus who calls them — which is exactly what each task's
+  "Modify:" list requires you to understand before you touch it. It is faster
+  and more accurate than a grep-and-read loop, and it shows the blast radius a
+  signature change will have on callers you did not know about.
 - **The office is optional in the same way MCP is.** A missing directory, an
   unreachable server, a failed spawn: a note in the conversation, never a fatal
   error, never a panic.
