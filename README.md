@@ -69,6 +69,9 @@ With `RIGAGENT_PROVIDER` and `RIGAGENT_MODEL` set in `.env`, plain
 | `--context-window` | `RIGAGENT_CONTEXT_WINDOW` | per provider | Tokens assumed to fit, for the footer gauge only |
 | `--skills-dir` | `RIGAGENT_SKILLS_DIR` | none | Directory of `*/SKILL.md` documents |
 | `--shell-dir` | `RIGAGENT_SHELL_DIR` | none | Working directory for `run_shell`; unset disables the tool |
+| `--office-dir` | `RIGAGENT_OFFICE_DIR` | none | Directory holding the office registration; unset means no office |
+| `--office-name` | `RIGAGENT_OFFICE_NAME` | directory's name | This agent's name in the office |
+| `--office-bind` | `RIGAGENT_OFFICE_BIND` | `127.0.0.1:0` | Address the office server listens on |
 | `--mcp-config` | `RIGAGENT_MCP_CONFIG` | none | Path to an MCP server list |
 
 Default models are `gpt-4o-mini`, `deepseek-chat` and `llama3.2`.
@@ -86,6 +89,9 @@ Default models are `gpt-4o-mini`, `deepseek-chat` and `llama3.2`.
 | `RIGAGENT_CONTEXT_WINDOW` | optional | Assumed context window in tokens, for the footer gauge |
 | `RIGAGENT_SKILLS_DIR` | optional | Directory holding the skill library |
 | `RIGAGENT_SHELL_DIR` | optional | Working directory for `run_shell`; unset means no shell tool |
+| `RIGAGENT_OFFICE_DIR` | optional | Directory holding the office registration; unset means no office |
+| `RIGAGENT_OFFICE_NAME` | optional | This agent's name in the office; defaults to the directory's name |
+| `RIGAGENT_OFFICE_BIND` | optional | Address the office server listens on, default `127.0.0.1:0` |
 | `RUST_LOG` | optional | Log filter, e.g. `rigagent=debug` |
 
 Logging is file-only by design: the TUI owns the terminal, so anything printed
