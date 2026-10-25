@@ -49,8 +49,9 @@ pub fn claim(dir: &Path) -> io::Result<bool> {
     }
 }
 
-/// Reclaim a stale lock. A `create_new` guard makes reclamation single-file:
-/// two callers that both judged the lock stale cannot both act on it.
+/// Reclaim a stale lock. An advisory-locked guard makes reclamation
+/// single-file: two callers that both judged the lock stale cannot both act.
+/// A reclaimer holding it makes the other return `Ok(false)` and retry.
 fn reclaim(dir: &Path, lock: &Path) -> io::Result<bool> {
     let guard_path = dir.join("office.reclaim");
     let Some(_guard) = ReclaimGuard::take(&guard_path)? else {
@@ -70,44 +71,27 @@ fn reclaim(dir: &Path, lock: &Path) -> io::Result<bool> {
     }
 }
 
-/// Removes the guard however reclamation leaves, including on an error path.
-struct ReclaimGuard<'a> {
-    path: &'a Path,
+/// Exclusive while alive. The file is a stable rendezvous and is never
+/// unlinked; the OS releases its advisory lock when the handle closes or the
+/// process dies, so there is no age or takeover logic to get wrong.
+struct ReclaimGuard {
+    _file: fs::File,
 }
 
-impl<'a> ReclaimGuard<'a> {
-    fn take(path: &'a Path) -> io::Result<Option<Self>> {
-        match take_guard(path) {
-            Ok(()) => Ok(Some(Self { path })),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if !older_than(path, STALE_AFTER) {
-                    return Ok(None);
-                }
-                // A reclaimer crashed holding the guard; clear it and try once.
-                remove_if_present(path)?;
-                match take_guard(path) {
-                    Ok(()) => Ok(Some(Self { path })),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-                    Err(error) => Err(error),
-                }
-            }
-            Err(error) => Err(error),
+impl ReclaimGuard {
+    fn take(path: &Path) -> io::Result<Option<Self>> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error),
         }
     }
-}
-
-impl Drop for ReclaimGuard<'_> {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.path);
-    }
-}
-
-fn take_guard(path: &Path) -> io::Result<()> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map(|_| ())
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -296,6 +280,40 @@ mod tests {
             });
             assert_eq!(won, 1, "iteration {iteration}: exactly one reclaimer wins");
         }
+    }
+
+    #[test]
+    fn a_held_reclaim_guard_makes_a_reclaimer_defer() {
+        let dir = tempdir();
+        let mut child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let dead = child.id();
+        child.wait().expect("reap the child");
+        std::fs::write(dir.path().join("office.lock"), dead.to_string()).expect("a dead pid");
+
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join("office.reclaim"))
+            .expect("guard file");
+        held.try_lock().expect("hold the guard");
+
+        assert!(
+            !claim(dir.path()).expect("defer"),
+            "a reclaimer defers while the guard is held"
+        );
+
+        drop(held);
+        assert!(
+            claim(dir.path()).expect("reclaim"),
+            "the guard released, so the reclaimer wins"
+        );
     }
 
     #[test]
