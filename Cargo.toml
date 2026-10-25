@@ -32,6 +32,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+# HS256 tokens for the office. `rust_crypto` supplies the crypto provider;
+# the crate's default features do not include one.
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+rand = "0.10.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
