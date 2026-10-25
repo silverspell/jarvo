@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jarvo office</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="banner" role="alert" hidden></div>
+  <main>
+    <section class="room" aria-label="The room">
+      <header class="room-bar">
+        <h1>Jarvo office</h1>
+        <button id="spawn" type="button">+ Agent</button>
+      </header>
+      <div id="characters" class="characters"></div>
+      <p id="room-empty" class="empty" hidden>No Jarvos yet. Start one with --office-dir.</p>
+    </section>
+    <aside class="inspector" aria-label="Inspector">
+      <div id="notice" class="notice" role="status" hidden></div>
+      <p id="panel-empty" class="empty">Select a character to see its transcript.</p>
+      <div id="panel" hidden>
+        <header class="panel-head">
+          <h2 id="panel-name"></h2>
+          <p id="panel-meta" class="meta"></p>
+          <p id="panel-skills" class="skills"></p>
+        </header>
+        <div id="transcript" class="transcript" role="log" aria-live="polite"></div>
+        <form id="composer" class="composer">
+          <input id="command" type="text" autocomplete="off" placeholder="Type a message…">
+          <button type="submit">Send</button>
+        </form>
+      </div>
+    </aside>
+  </main>
+</body>
+</html>

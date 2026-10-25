@@ -10,7 +10,10 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
+use axum::http::{
+    HeaderMap, StatusCode,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
@@ -34,9 +37,9 @@ const BROADCAST_CAPACITY: usize = 256;
 /// Prompts waiting for one agent socket.
 const OUTBOX_CAPACITY: usize = 64;
 
-const PAGE: &str = "<!doctype html><meta charset=\"utf-8\">\
-<title>Jarvo office</title><h1>Jarvo office</h1>\
-<p>The office page arrives in a later task.</p>";
+const PAGE: &str = include_str!("web/index.html");
+const SCRIPT: &str = include_str!("web/app.js");
+const STYLE: &str = include_str!("web/style.css");
 
 /// Shared state: the signing key, the room, and the fan-out to browsers.
 #[derive(Clone)]
@@ -295,6 +298,8 @@ fn router(state: Office) -> Router {
         ));
     Router::new()
         .route("/", get(page_handler))
+        .route("/app.js", get(script_handler))
+        .route("/style.css", get(style_handler))
         .merge(http)
         .merge(sockets)
         .with_state(state)
@@ -302,6 +307,14 @@ fn router(state: Office) -> Router {
 
 async fn page_handler() -> Html<&'static str> {
     Html(PAGE)
+}
+
+async fn script_handler() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/javascript; charset=utf-8")], SCRIPT)
+}
+
+async fn style_handler() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/css; charset=utf-8")], STYLE)
 }
 
 async fn agents_handler(State(state): State<Office>) -> Json<Vec<AgentInfo>> {
@@ -513,6 +526,96 @@ mod tests {
     fn router_for_tests() -> (Router, String) {
         let token = auth::issue(KEY, "browser").expect("issue");
         (router(Office::new(KEY.to_vec())), token)
+    }
+
+    #[tokio::test]
+    async fn the_page_is_served() {
+        let (app, _) = router_for_tests();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let page = String::from_utf8_lossy(&body);
+        assert!(page.contains("<html"));
+        assert!(
+            page.contains("/app.js") && page.contains("/style.css"),
+            "the page loads its script and stylesheet"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scripts_are_served() {
+        let (app, _) = router_for_tests();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .expect("a content type");
+        assert!(
+            content_type.contains("javascript"),
+            "app.js is served as JavaScript: {content_type}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let script = String::from_utf8_lossy(&body);
+        assert!(
+            script.contains("localStorage"),
+            "the token is kept in localStorage"
+        );
+        assert!(
+            script.contains("WebSocket"),
+            "the page opens a WebSocket to the office"
+        );
+        assert!(
+            !script.contains("document.cookie"),
+            "a token must never be kept in a cookie"
+        );
+        assert!(
+            script.contains("/ws/browser"),
+            "the page connects to the browser socket"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/style.css")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .expect("a content type");
+        assert!(
+            content_type.contains("text/css"),
+            "style.css is served as CSS: {content_type}"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,266 @@
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #0f1115;
+  color: #e6e8ee;
+}
+
+#banner {
+  padding: 0.6rem 1rem;
+  background: #3a1d1d;
+  color: #ffd9d9;
+  border-bottom: 1px solid #7a3a3a;
+}
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  height: 100%;
+}
+
+.room {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid #262b36;
+}
+
+.room-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #262b36;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #aab3c5;
+}
+
+.characters {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  align-content: start;
+  gap: 0.75rem;
+  padding: 1rem;
+  overflow: auto;
+}
+
+.character {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid #2c3342;
+  border-radius: 0.5rem;
+  background: #161a22;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.character:hover {
+  border-color: #4a5570;
+}
+
+.character.selected {
+  border-color: #7aa2ff;
+  box-shadow: 0 0 0 1px #7aa2ff inset;
+}
+
+.character.left {
+  opacity: 0.45;
+}
+
+.character .name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.character .state {
+  color: #8b94a7;
+  font-size: 0.75rem;
+}
+
+.dot {
+  flex: none;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: #5b6478;
+}
+
+.dot.thinking {
+  background: #e0b341;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.dot.running {
+  background: #59c08b;
+}
+
+.dot.waiting {
+  background: #7aa2ff;
+}
+
+.dot.left {
+  background: #3a4150;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.inspector {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: #12151c;
+}
+
+.notice {
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid #262b36;
+  color: #ffd9a8;
+  font-size: 0.85rem;
+}
+
+#panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.panel-head {
+  padding: 0.9rem 1rem;
+  border-bottom: 1px solid #262b36;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.meta {
+  margin: 0.25rem 0 0;
+  color: #8b94a7;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.skills {
+  margin: 0.35rem 0 0;
+  color: #9fb4e8;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.transcript {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 1rem;
+  overflow: auto;
+}
+
+.line {
+  padding: 0.35rem 0.55rem;
+  border-radius: 0.35rem;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.line.user {
+  background: #1d2637;
+  border-left: 3px solid #7aa2ff;
+}
+
+.line.assistant {
+  background: #161a22;
+  border-left: 3px solid #59c08b;
+}
+
+.line.system {
+  padding: 0.1rem 0.55rem;
+  color: #9aa3b5;
+  font-size: 0.8rem;
+}
+
+.line.queued {
+  padding: 0.1rem 0.55rem;
+  color: #7aa2ff;
+  font-size: 0.8rem;
+}
+
+.line.error {
+  background: #2a1717;
+  border-left: 3px solid #ff6b6b;
+  color: #ff9b9b;
+}
+
+.composer {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid #262b36;
+}
+
+.composer input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #2c3342;
+  border-radius: 0.4rem;
+  background: #0f1115;
+  color: inherit;
+  font: inherit;
+}
+
+.composer button,
+#spawn {
+  padding: 0.5rem 0.8rem;
+  border: 1px solid #3a4661;
+  border-radius: 0.4rem;
+  background: #1b2231;
+  color: #dfe6f5;
+  font: inherit;
+  cursor: pointer;
+}
+
+.composer button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.empty {
+  margin: 0;
+  padding: 1rem;
+  color: #7c8598;
+  font-size: 0.85rem;
+}
