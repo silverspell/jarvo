@@ -28,10 +28,10 @@ const timers = new Map();
 let socket = null;
 let selectedId = null;
 let awaitTail = false;
-/** Live events seen while the tail is on its way. */
+/** Live events seen while the tail is on its way: `[turn, seq, event]`. */
 let buffered = [];
-/** Tail events whose broadcast may still arrive after the tail. */
-let residual = new Map();
+/** Highest sequence rendered for the selected agent. */
+let lastSeq = 0;
 /** The text node of the assistant line currently being appended to. */
 let assistantText = null;
 
@@ -257,7 +257,7 @@ function selectAgent(id) {
   selectedId = id;
   awaitTail = true;
   buffered = [];
-  residual = new Map();
+  lastSeq = 0;
   clearTranscript();
   renderPanel(agent);
   for (const other of agents.values()) renderCard(other);
@@ -296,7 +296,7 @@ function showEmptyPanel() {
   selectedId = null;
   awaitTail = false;
   buffered = [];
-  residual = new Map();
+  lastSeq = 0;
   clearTranscript();
   panel.hidden = true;
   panelEmpty.hidden = false;
@@ -318,20 +318,12 @@ function onTurn(message) {
   if (id !== selectedId) return;
 
   if (awaitTail) {
-    buffered.push([message.turn, message.event]);
+    buffered.push([message.turn, message.seq, message.event]);
     return;
   }
 
-  // ponytail: events are matched by turn + content, so a broadcast that was
-  // already part of the tail is skipped. A lagged broadcast can swallow one
-  // identical later event; Completed repairs the visible text.
-  const key = eventKey(message.turn, message.event);
-  const pending = residual.get(key) || 0;
-  if (pending > 0) {
-    setCount(residual, key, pending - 1);
-    return;
-  }
-
+  if (message.seq <= lastSeq) return;
+  lastSeq = message.seq;
   renderEvent(message.event);
   transcript.scrollTop = transcript.scrollHeight;
 }
@@ -340,34 +332,27 @@ function onTail(message) {
   if (message.id !== selectedId || !awaitTail) return;
   awaitTail = false;
 
-  const counts = new Map();
-  for (const [turn, event] of message.events) {
-    bump(counts, eventKey(turn, event), 1);
-  }
-
-  const extra = [];
-  for (const [turn, event] of buffered) {
-    const key = eventKey(turn, event);
-    const seen = counts.get(key) || 0;
-    if (seen > 0) setCount(counts, key, seen - 1);
-    else extra.push(event);
-  }
-  buffered = [];
-  residual = counts;
-
   clearTranscript();
   let status = 'idle';
   let tool = null;
-  for (const [, event] of message.events) {
+  lastSeq = 0;
+  for (const [, seq, event] of message.events) {
     renderEvent(event);
+    lastSeq = seq;
     const next = statusOf(event);
     if (next) [status, tool] = [next.status, next.tool];
   }
-  for (const event of extra) {
+
+  // Everything at or below the tail's last sequence is already rendered;
+  // a buffered event above it is what the snapshot missed.
+  for (const [, seq, event] of buffered) {
+    if (seq <= lastSeq) continue;
     renderEvent(event);
+    lastSeq = seq;
     const next = statusOf(event);
     if (next) [status, tool] = [next.status, next.tool];
   }
+  buffered = [];
 
   const agent = agents.get(selectedId);
   if (agent) {
@@ -382,19 +367,6 @@ function onRefused(message) {
   const line = `refused: ${message.reason}`;
   if (message.id === selectedId) appendLine('error', line);
   else showNotice(line);
-}
-
-function eventKey(turn, event) {
-  return `${turn}\u0000${JSON.stringify(event)}`;
-}
-
-function bump(map, key, delta) {
-  setCount(map, key, (map.get(key) || 0) + delta);
-}
-
-function setCount(map, key, count) {
-  if (count === 0) map.delete(key);
-  else map.set(key, count);
 }
 
 function statusOf(event) {

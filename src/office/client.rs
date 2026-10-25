@@ -417,7 +417,9 @@ mod tests {
                 let Ok(message) = serde_json::from_str::<ToBrowser>(text.as_str()) else {
                     continue;
                 };
-                if let ToBrowser::Turn { id, turn, event } = message
+                if let ToBrowser::Turn {
+                    id, turn, event, ..
+                } = message
                     && id == test_info().id
                 {
                     assert_eq!(turn, TurnId(1));

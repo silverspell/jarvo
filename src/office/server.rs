@@ -78,10 +78,12 @@ impl Office {
     }
 
     async fn publish_turn(&self, id: &AgentId, generation: u64, turn: TurnId, event: TurnEvent) {
-        if push_tail(&self.room, id, generation, turn.clone(), event.clone()).await {
+        if let Some(seq) = push_tail(&self.room, id, generation, turn.clone(), event.clone()).await
+        {
             self.broadcast(ToBrowser::Turn {
                 id: id.clone(),
                 turn,
+                seq,
                 event,
             });
         }
@@ -104,7 +106,10 @@ struct Room {
 
 struct Agent {
     info: AgentInfo,
-    tail: VecDeque<(TurnId, TurnEvent)>,
+    /// `(turn, seq, event)`, the newest last.
+    tail: VecDeque<(TurnId, u64, TurnEvent)>,
+    /// Monotonic per agent, starts at 1 for the first stored event.
+    next_seq: u64,
     outbox: mpsc::Sender<ToAgent>,
     connected: bool,
     generation: u64,
@@ -120,12 +125,13 @@ impl Room {
         self.next_generation
     }
 
-    /// Insert or reconnect an agent, preserving the tail either way.
+    /// Insert or reconnect an agent, preserving the tail and the sequence
+    /// counter either way. Restarting the counter beside an old tail would
+    /// make a browser drop the new events as already seen.
     fn add(&mut self, info: AgentInfo, outbox: mpsc::Sender<ToAgent>) -> u64 {
-        let tail = self
-            .agents
-            .remove(&info.id.0)
-            .map(|agent| agent.tail)
+        let previous = self.agents.remove(&info.id.0);
+        let (tail, next_seq) = previous
+            .map(|agent| (agent.tail, agent.next_seq))
             .unwrap_or_default();
         let generation = self.next_generation();
         self.agents.insert(
@@ -133,6 +139,7 @@ impl Room {
             Agent {
                 info,
                 tail,
+                next_seq,
                 outbox,
                 connected: true,
                 generation,
@@ -185,27 +192,27 @@ impl Room {
     }
 }
 
-/// Append a served event if it belongs to the current connection. `false`
-/// means a replaced socket sent it.
+/// Append a served event if it belongs to the current connection, returning
+/// the sequence assigned to it. `None` means a replaced socket sent it.
 async fn push_tail(
     room: &Mutex<Room>,
     id: &AgentId,
     generation: u64,
     turn: TurnId,
     event: TurnEvent,
-) -> bool {
+) -> Option<u64> {
     let mut room = room.lock().await;
-    let Some(agent) = room.agents.get_mut(&id.0) else {
-        return false;
-    };
+    let agent = room.agents.get_mut(&id.0)?;
     if agent.generation != generation {
-        return false;
+        return None;
     }
-    agent.tail.push_back((turn, event));
+    agent.next_seq += 1;
+    let seq = agent.next_seq;
+    agent.tail.push_back((turn, seq, event));
     while agent.tail.len() > TAIL_CAP {
         agent.tail.pop_front();
     }
-    true
+    Some(seq)
 }
 
 /// Forget a departed agent unless its id has reconnected in the meantime.
@@ -596,6 +603,10 @@ mod tests {
             script.contains("/ws/browser"),
             "the page connects to the browser socket"
         );
+        assert!(
+            !script.contains("residual"),
+            "tail/live duplication is decided by sequence, not by content"
+        );
 
         let response = app
             .oneshot(
@@ -615,6 +626,45 @@ mod tests {
         assert!(
             content_type.contains("text/css"),
             "style.css is served as CSS: {content_type}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_keeps_the_sequence_beside_the_old_tail() {
+        let office = Office::new(KEY.to_vec());
+        let (first_outbox, _first_inbox) = mpsc::channel(8);
+        let (info, generation) = office.join(agent("a", "bob"), first_outbox).await;
+        office
+            .publish_turn(
+                &info.id,
+                generation,
+                TurnId(1),
+                TurnEvent::Started { prompt: "q".into() },
+            )
+            .await;
+
+        let (second_outbox, _second_inbox) = mpsc::channel(8);
+        let (_, generation) = office.join(info.clone(), second_outbox).await;
+        office
+            .publish_turn(
+                &info.id,
+                generation,
+                TurnId(2),
+                TurnEvent::Started {
+                    prompt: "q2".into(),
+                },
+            )
+            .await;
+
+        let room = office.room.lock().await;
+        let seqs: Vec<u64> = room.agents[&info.id.0]
+            .tail
+            .iter()
+            .map(|(_, seq, _)| *seq)
+            .collect();
+        assert!(
+            seqs == [1, 2],
+            "a reconnect continues the sequence: {seqs:?}"
         );
     }
 
@@ -662,7 +712,7 @@ mod tests {
         let generation = room.lock().await.add(agent("a", "bob"), outbox);
 
         for n in 1..=300 {
-            push_tail(
+            let seq = push_tail(
                 &room,
                 &id,
                 generation,
@@ -671,14 +721,72 @@ mod tests {
                     text: n.to_string(),
                 },
             )
-            .await;
+            .await
+            .expect("the current socket appends");
+            assert_eq!(seq, n);
         }
 
         let room = room.lock().await;
         let tail = &room.agents[&id.0].tail;
         assert_eq!(tail.len(), 200);
         assert_eq!(tail.front().expect("first kept").0, TurnId(101));
+        assert_eq!(tail.front().expect("first kept").1, 101);
         assert_eq!(tail.back().expect("last kept").0, TurnId(300));
+        assert_eq!(tail.back().expect("last kept").1, 300);
+    }
+
+    #[tokio::test]
+    async fn turns_carry_increasing_sequences_and_the_tail_keeps_them() {
+        let office = Office::new(KEY.to_vec());
+        let (outbox, _inbox) = mpsc::channel(8);
+        let (info, generation) = office.join(agent("a", "bob"), outbox).await;
+        let mut turns = office.browsers.subscribe();
+
+        office
+            .publish_turn(
+                &info.id,
+                generation,
+                TurnId(1),
+                TurnEvent::Started { prompt: "q".into() },
+            )
+            .await;
+        office
+            .publish_turn(
+                &info.id,
+                generation,
+                TurnId(1),
+                TurnEvent::Completed { text: "a".into() },
+            )
+            .await;
+
+        let mut broadcast_seqs = Vec::new();
+        for _ in 0..2 {
+            let Ok(ToBrowser::Turn { id, seq, .. }) = turns.try_recv() else {
+                panic!("two turns are broadcast");
+            };
+            assert!(id == info.id, "the turn names the agent");
+            broadcast_seqs.push(seq);
+        }
+        assert!(
+            broadcast_seqs == [1, 2],
+            "sequences increase per agent: {broadcast_seqs:?}"
+        );
+
+        let reply = handle_browser_message(
+            &office.room,
+            FromBrowser::Select {
+                id: info.id.clone(),
+            },
+        )
+        .await;
+        let Some(ToBrowser::Tail { events, .. }) = reply else {
+            panic!("a select returns the tail");
+        };
+        let tail_seqs: Vec<u64> = events.iter().map(|(_, seq, _)| *seq).collect();
+        assert!(
+            tail_seqs == [1, 2],
+            "the tail preserves the sequences: {tail_seqs:?}"
+        );
     }
 
     #[tokio::test]

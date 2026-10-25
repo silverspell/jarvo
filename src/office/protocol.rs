@@ -68,11 +68,14 @@ pub enum ToBrowser {
     Turn {
         id: AgentId,
         turn: TurnId,
+        /// Monotonic per agent, starts at 1. The browser uses it to tell a
+        /// live event apart from one already included in a `Tail`.
+        seq: u64,
         event: TurnEvent,
     },
     Tail {
         id: AgentId,
-        events: Vec<(TurnId, TurnEvent)>,
+        events: Vec<(TurnId, u64, TurnEvent)>,
     },
     Refused {
         id: AgentId,
