@@ -65,33 +65,38 @@ impl Office {
         let _ = self.browsers.send(message);
     }
 
-    async fn join(&self, mut info: AgentInfo, outbox: mpsc::Sender<ToAgent>) -> AgentInfo {
+    async fn join(&self, mut info: AgentInfo, outbox: mpsc::Sender<ToAgent>) -> (AgentInfo, u64) {
         let mut room = self.room.lock().await;
         info.name = unique_name(room.names(&info.id.0), &info.name);
-        room.add(info.clone(), outbox);
+        let generation = room.add(info.clone(), outbox);
         drop(room);
         self.broadcast(ToBrowser::Joined { info: info.clone() });
-        info
+        (info, generation)
     }
 
-    async fn publish_turn(&self, id: &AgentId, turn: TurnId, event: TurnEvent) {
-        push_tail(&self.room, id, turn.clone(), event.clone()).await;
-        self.broadcast(ToBrowser::Turn {
-            id: id.clone(),
-            turn,
-            event,
-        });
+    async fn publish_turn(&self, id: &AgentId, generation: u64, turn: TurnId, event: TurnEvent) {
+        if push_tail(&self.room, id, generation, turn.clone(), event.clone()).await {
+            self.broadcast(ToBrowser::Turn {
+                id: id.clone(),
+                turn,
+                event,
+            });
+        }
     }
 
-    /// Mark the agent disconnected. `true` means this close still owes a `Left`.
-    async fn agent_gone(&self, id: &AgentId) -> bool {
-        self.room.lock().await.gone(&id.0)
+    /// Mark the agent disconnected. `Some` carries the generation the forget
+    /// timer must use; `None` means the close came from a replaced socket.
+    async fn agent_gone(&self, id: &AgentId, generation: u64) -> Option<u64> {
+        self.room.lock().await.gone(&id.0, generation)
     }
 }
 
 #[derive(Default)]
 struct Room {
     agents: HashMap<String, Agent>,
+    /// Bumped on every join and close, so a stale socket or timer can tell it
+    /// has been superseded.
+    next_generation: u64,
 }
 
 struct Agent {
@@ -99,6 +104,7 @@ struct Agent {
     tail: VecDeque<(TurnId, TurnEvent)>,
     outbox: mpsc::Sender<ToAgent>,
     connected: bool,
+    generation: u64,
 }
 
 impl Room {
@@ -106,13 +112,19 @@ impl Room {
         Self::default()
     }
 
+    fn next_generation(&mut self) -> u64 {
+        self.next_generation += 1;
+        self.next_generation
+    }
+
     /// Insert or reconnect an agent, preserving the tail either way.
-    fn add(&mut self, info: AgentInfo, outbox: mpsc::Sender<ToAgent>) {
+    fn add(&mut self, info: AgentInfo, outbox: mpsc::Sender<ToAgent>) -> u64 {
         let tail = self
             .agents
             .remove(&info.id.0)
             .map(|agent| agent.tail)
             .unwrap_or_default();
+        let generation = self.next_generation();
         self.agents.insert(
             info.id.0.clone(),
             Agent {
@@ -120,8 +132,10 @@ impl Room {
                 tail,
                 outbox,
                 connected: true,
+                generation,
             },
         );
+        generation
     }
 
     fn names<'a>(&'a self, except: &'a str) -> impl Iterator<Item = &'a str> {
@@ -138,37 +152,63 @@ impl Room {
             .collect()
     }
 
-    /// `true` only on the first close, so a `Left` goes out exactly once.
-    fn gone(&mut self, id: &str) -> bool {
-        match self.agents.get_mut(id) {
-            Some(agent) if agent.connected => {
-                agent.connected = false;
-                true
-            }
-            _ => false,
+    /// Mark the connection behind `generation` disconnected, returning the
+    /// fresh generation for its forget timer. A replaced socket gets `None`,
+    /// so it cannot mark a live reconnection gone or schedule its removal.
+    fn gone(&mut self, id: &str, generation: u64) -> Option<u64> {
+        let current = self
+            .agents
+            .get(id)
+            .is_some_and(|agent| agent.connected && agent.generation == generation);
+        if !current {
+            return None;
+        }
+        let fresh = self.next_generation();
+        let agent = self.agents.get_mut(id)?;
+        agent.connected = false;
+        agent.generation = fresh;
+        Some(fresh)
+    }
+
+    /// Forget a departed agent only when its close is still the latest word.
+    fn forget(&mut self, id: &str, generation: u64) {
+        if self
+            .agents
+            .get(id)
+            .is_some_and(|agent| !agent.connected && agent.generation == generation)
+        {
+            self.agents.remove(id);
         }
     }
 }
 
-/// Append a served or stored event, dropping the oldest beyond the cap.
-async fn push_tail(room: &Mutex<Room>, id: &AgentId, turn: TurnId, event: TurnEvent) {
+/// Append a served event if it belongs to the current connection. `false`
+/// means a replaced socket sent it.
+async fn push_tail(
+    room: &Mutex<Room>,
+    id: &AgentId,
+    generation: u64,
+    turn: TurnId,
+    event: TurnEvent,
+) -> bool {
     let mut room = room.lock().await;
     let Some(agent) = room.agents.get_mut(&id.0) else {
-        return;
+        return false;
     };
+    if agent.generation != generation {
+        return false;
+    }
     agent.tail.push_back((turn, event));
     while agent.tail.len() > TAIL_CAP {
         agent.tail.pop_front();
     }
+    true
 }
 
 /// Forget a departed agent unless its id has reconnected in the meantime.
-async fn forget_after(room: Arc<Mutex<Room>>, id: AgentId, delay: Duration) {
+async fn forget_after(room: Arc<Mutex<Room>>, id: AgentId, generation: u64, delay: Duration) {
     tokio::time::sleep(delay).await;
-    let mut room = room.lock().await;
-    if room.agents.get(&id.0).is_some_and(|agent| !agent.connected) {
-        room.agents.remove(&id.0);
-    }
+    room.lock().await.forget(&id.0, generation);
 }
 
 /// The display name with a `-2`, `-3`, ... suffix if it is already taken.
@@ -368,7 +408,7 @@ async fn agent_socket(mut socket: WebSocket, state: Office) {
     let (outbox, mut inbox) = mpsc::channel(OUTBOX_CAPACITY);
     // Keeps `inbox` open until the socket closes, before and after `Hello`.
     let _keepalive = outbox.clone();
-    let mut id: Option<AgentId> = None;
+    let mut connection: Option<(AgentId, u64)> = None;
 
     loop {
         tokio::select! {
@@ -385,13 +425,16 @@ async fn agent_socket(mut socket: WebSocket, state: Office) {
                     Some(Err(_)) | None => break,
                 };
                 match serde_json::from_str::<FromAgent>(text.as_str()) {
+                    // A socket owns exactly one registration; a later Hello
+                    // would orphan the first entry.
+                    Ok(FromAgent::Hello { .. }) if connection.is_some() => continue,
                     Ok(FromAgent::Hello { info }) => {
-                        let info = state.join(info, outbox.clone()).await;
-                        id = Some(info.id);
+                        let (info, generation) = state.join(info, outbox.clone()).await;
+                        connection = Some((info.id, generation));
                     }
                     Ok(FromAgent::Turn { turn, event }) => {
-                        if let Some(id) = &id {
-                            state.publish_turn(id, turn, event).await;
+                        if let Some((id, generation)) = &connection {
+                            state.publish_turn(id, *generation, turn, event).await;
                         }
                     }
                     Err(_) => continue,
@@ -400,11 +443,16 @@ async fn agent_socket(mut socket: WebSocket, state: Office) {
         }
     }
 
-    if let Some(id) = id
-        && state.agent_gone(&id).await
+    if let Some((id, generation)) = connection
+        && let Some(generation) = state.agent_gone(&id, generation).await
     {
         state.broadcast(ToBrowser::Left { id: id.clone() });
-        tokio::spawn(forget_after(state.room.clone(), id, FORGET_AFTER));
+        tokio::spawn(forget_after(
+            state.room.clone(),
+            id,
+            generation,
+            FORGET_AFTER,
+        ));
     }
 }
 
@@ -508,12 +556,13 @@ mod tests {
         let (outbox, _inbox) = mpsc::channel(8);
         let room = Mutex::new(Room::new());
         let id = AgentId("a".into());
-        room.lock().await.add(agent("a", "bob"), outbox);
+        let generation = room.lock().await.add(agent("a", "bob"), outbox);
 
         for n in 1..=300 {
             push_tail(
                 &room,
                 &id,
+                generation,
                 TurnId(n),
                 TurnEvent::Delta {
                     text: n.to_string(),
@@ -583,28 +632,94 @@ mod tests {
         let (outbox, _inbox) = mpsc::channel(8);
         let room = Arc::new(Mutex::new(Room::new()));
         let id = AgentId("a".into());
-        {
+        let closed = {
             let mut room = room.lock().await;
-            room.add(agent("a", "bob"), outbox.clone());
-            assert!(room.gone(&id.0), "the first close is reported");
-            assert!(!room.gone(&id.0), "a close is reported only once");
-        }
-        forget_after(room.clone(), id.clone(), Duration::from_millis(1)).await;
+            let generation = room.add(agent("a", "bob"), outbox.clone());
+            let closed = room.gone(&id.0, generation).expect("the first close");
+            assert!(
+                room.gone(&id.0, generation).is_none(),
+                "a close is reported only once"
+            );
+            closed
+        };
+        forget_after(room.clone(), id.clone(), closed, Duration::from_millis(1)).await;
         assert!(
             room.lock().await.agents.is_empty(),
             "a gone agent is forgotten"
         );
 
-        {
+        let closed = {
             let mut room = room.lock().await;
-            room.add(agent("a", "bob"), outbox);
-            assert!(room.gone(&id.0));
-            room.add(agent("a", "bob"), mpsc::channel(8).0);
-        }
-        forget_after(room.clone(), id.clone(), Duration::from_millis(1)).await;
+            let generation = room.add(agent("a", "bob"), outbox);
+            room.gone(&id.0, generation).expect("a close")
+        };
+        room.lock().await.add(agent("a", "bob"), mpsc::channel(8).0);
+        forget_after(room.clone(), id.clone(), closed, Duration::from_millis(1)).await;
         assert!(
             !room.lock().await.agents.is_empty(),
             "a reconnect cancels the removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flapped_agent_gets_a_fresh_forget_window() {
+        let room = Mutex::new(Room::new());
+        let id = AgentId("a".into());
+
+        let first = room.lock().await.add(agent("a", "bob"), mpsc::channel(8).0);
+        let first_timer = room.lock().await.gone(&id.0, first).expect("first close");
+        let second = room.lock().await.add(agent("a", "bob"), mpsc::channel(8).0);
+        let second_timer = room.lock().await.gone(&id.0, second).expect("second close");
+
+        room.lock().await.forget(&id.0, first_timer);
+        assert!(
+            room.lock().await.agents.contains_key(&id.0),
+            "the first timer must not shorten the latest close's window"
+        );
+
+        room.lock().await.forget(&id.0, second_timer);
+        assert!(
+            !room.lock().await.agents.contains_key(&id.0),
+            "the latest close's timer forgets the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_cannot_mark_a_reconnected_agent_gone() {
+        let office = Office::new(KEY.to_vec());
+        let (first_outbox, _first_inbox) = mpsc::channel(8);
+        let (info, stale) = office.join(agent("a", "bob"), first_outbox).await;
+
+        let (second_outbox, _second_inbox) = mpsc::channel(8);
+        let (_, current) = office.join(info.clone(), second_outbox).await;
+        assert_ne!(stale, current, "a reconnect gets a fresh generation");
+
+        let mut left = office.browsers.subscribe();
+        assert!(
+            office.agent_gone(&info.id, stale).await.is_none(),
+            "a stale close is ignored"
+        );
+        assert!(
+            matches!(left.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "a stale close must not announce a Left"
+        );
+        {
+            let room = office.room.lock().await;
+            let agent = &room.agents[&info.id.0];
+            assert!(agent.connected, "the live connection is still connected");
+            assert_eq!(agent.generation, current);
+        }
+
+        forget_after(
+            office.room.clone(),
+            info.id.clone(),
+            stale,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            office.room.lock().await.agents.contains_key(&info.id.0),
+            "an old timer cannot remove the live agent"
         );
     }
 }
