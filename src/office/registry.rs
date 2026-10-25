@@ -39,18 +39,81 @@ pub fn claim(dir: &Path) -> io::Result<bool> {
     match take_lock(&lock) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if !is_stale(dir, &lock) {
-                return Ok(false);
-            }
-            // The previous winner is gone; clear its claim and retry once.
-            let _ = fs::remove_file(&lock);
-            let _ = fs::remove_file(dir.join("office.json"));
-            match take_lock(&lock) {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-                Err(error) => Err(error),
+            if is_stale(dir, &lock) {
+                reclaim(dir, &lock)
+            } else {
+                Ok(false)
             }
         }
+        Err(error) => Err(error),
+    }
+}
+
+/// Reclaim a stale lock. A `create_new` guard makes reclamation single-file:
+/// two callers that both judged the lock stale cannot both act on it.
+fn reclaim(dir: &Path, lock: &Path) -> io::Result<bool> {
+    let guard_path = dir.join("office.reclaim");
+    let Some(_guard) = ReclaimGuard::take(&guard_path)? else {
+        return Ok(false);
+    };
+    // Another process may have installed a live lock between the caller's
+    // staleness check and this guard. Judge again before removing anything.
+    if !is_stale(dir, lock) {
+        return Ok(false);
+    }
+    remove_if_present(lock)?;
+    remove_if_present(&dir.join("office.json"))?;
+    match take_lock(lock) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes the guard however reclamation leaves, including on an error path.
+struct ReclaimGuard<'a> {
+    path: &'a Path,
+}
+
+impl<'a> ReclaimGuard<'a> {
+    fn take(path: &'a Path) -> io::Result<Option<Self>> {
+        match take_guard(path) {
+            Ok(()) => Ok(Some(Self { path })),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !older_than(path, STALE_AFTER) {
+                    return Ok(None);
+                }
+                // A reclaimer crashed holding the guard; clear it and try once.
+                remove_if_present(path)?;
+                match take_guard(path) {
+                    Ok(()) => Ok(Some(Self { path })),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for ReclaimGuard<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path);
+    }
+}
+
+fn take_guard(path: &Path) -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -64,7 +127,15 @@ pub fn publish(dir: &Path, registration: &Registration) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(dir.join("office.json"))?.write_all(&json)
+    let mut file = options.open(dir.join("office.json"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `mode` above only applies at creation; an older registration with
+        // wider permissions must not keep them, since it carries the token.
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&json)
 }
 
 fn create_office_dir(dir: &Path) -> io::Result<()> {
@@ -190,6 +261,44 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_reclaimers_crown_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        for iteration in 0..25 {
+            let dir = tempdir();
+            let mut child = Command::new("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn true");
+            let dead = child.id();
+            child.wait().expect("reap the child");
+            std::fs::write(dir.path().join("office.lock"), dead.to_string()).expect("a dead pid");
+
+            let barrier = Arc::new(Barrier::new(2));
+            let won = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        let barrier = Arc::clone(&barrier);
+                        let dir = dir.path();
+                        scope.spawn(move || {
+                            barrier.wait();
+                            claim(dir).expect("claim")
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("claim thread"))
+                    .filter(|won| *won)
+                    .count()
+            });
+            assert_eq!(won, 1, "iteration {iteration}: exactly one reclaimer wins");
+        }
+    }
+
+    #[test]
     fn a_claim_creates_a_missing_directory() {
         let root = tempdir();
         let dir = root.path().join("not-yet");
@@ -203,6 +312,31 @@ mod tests {
         let path = root.path().join("office");
         std::fs::write(&path, "not a directory").expect("a file in the way");
         assert!(claim(&path).is_err(), "a non-directory path is an error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publishing_tightens_an_existing_registration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        let path = dir.path().join("office.json");
+        std::fs::write(&path, "an old registration").expect("old registration");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("a wide old mode");
+
+        let registration = Registration {
+            port: 7777,
+            pid: std::process::id(),
+            token: "t".into(),
+        };
+        publish(dir.path(), &registration).expect("publish");
+
+        let mode = std::fs::metadata(&path)
+            .expect("registration")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "an existing wider mode is tightened");
     }
 
     #[cfg(unix)]
