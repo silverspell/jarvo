@@ -19,8 +19,9 @@ the office is a second consumer of the events the TUI already receives, and a
 second producer of the commands the TUI already sends.
 
 **Tech Stack:** Rust 2024, Tokio, `axum` (HTTP + WebSocket server),
-`tokio-tungstenite` (client), `jsonwebtoken` (HS256), `serde_json`, plain
-HTML/CSS/JS with no framework, `tmux` for spawned agents.
+`tokio-tungstenite` (client), `jsonwebtoken` (HS256) with `rand` for the
+signing key, `serde_json`, plain HTML/CSS/JS with no framework, `tmux` for
+spawned agents. Tests add `tempfile` and `tower`.
 
 **Spec:** `docs/superpowers/specs/2026-10-25-jarvo-office-design.md` — read it
 first. It explains *why*; this plan says *what*.
@@ -60,6 +61,17 @@ first. It explains *why*; this plan says *what*.
   information goes in the transcript, not the footer.
 - **Pin dependency versions by adding them with `cargo add`** and record the
   resolved version in `Cargo.toml`. Do not guess version numbers.
+- **The dependency set is exactly this, and nothing more:** `axum` (Task 7),
+  `tokio-tungstenite` (Task 8), `jsonwebtoken` (Task 6), `rand` (Task 6 — the
+  32 random bytes of the signing key; nothing in the tree generates randomness
+  today), and as `[dev-dependencies]` `tempfile` (Tasks 5 and 8) and `tower`
+  with its `util` feature (Tasks 7 and 9, for `ServiceExt::oneshot`).
+  `tower-http` is **not** needed: the three static files are returned by
+  handlers that hold `include_str!`, not by a file-serving layer. `serde`,
+  `serde_json` and `tokio` are already there.
+- **Assert with `assert!`, never `assert_eq!(x, true)`.** Clippy's
+  `bool_assert_comparison` fires on the second form, and a clippy warning is a
+  failed task here.
 
 ## Review Focus
 
@@ -71,26 +83,35 @@ the task that owns the code.
 2. **An office that is unreachable, dead, or never started must leave Jarvo
    working exactly as it does today** — a note, then business as usual. Task 8.
 3. **Two Jarvos starting in the same moment must produce exactly one server**,
-   with the loser joining it rather than failing. Task 5.
-4. **A stalled office must never stall the agent or the TUI.** The office's
-   event channel is lossy on purpose; a full one drops events and keeps going.
-   Task 3.
+   with the loser joining it rather than failing — and a Jarvo that wins the
+   claim and then dies before the server registers must not lock the office
+   out forever. Task 5.
+4. **A stalled office must never stall the agent or the TUI, and the server it
+   spawns must never write to the terminal the TUI owns.** The office's event
+   channel is lossy on purpose; a full one drops events and keeps going
+   (Task 3), and the spawned server's three streams are `Stdio::null()`
+   (Task 8).
 5. **A request with no token, an expired token, or a tampered signature is
    refused** — on the HTTP routes and on the WebSocket handshake alike. Tasks 6
    and 7.
 
 ---
 
-### Task 1: The wire format
+### Task 1: The wire format and the one command parser
 
 **Files:**
 - Create: `src/office/mod.rs` (just `pub mod protocol;` for now)
 - Create: `src/office/protocol.rs`
-- Modify: `src/main.rs:6-12` (add `mod office;`)
-- Test: in `src/office/protocol.rs`, `#[cfg(test)] mod tests`
+- Create: `src/command.rs` — the `/` parser, lifted out of `tui/mod.rs::submit`
+- Modify: `src/main.rs:6-12` (add `mod command;` and `mod office;`)
+- Modify: `src/tui/mod.rs:225-281` — `submit` asks the parser instead of
+  parsing inline, and `skill_command` moves into `src/command.rs`
+- Test: `#[cfg(test)] mod tests` in `src/office/protocol.rs` and in
+  `src/command.rs`
 
 **Interfaces:**
-- Produces: the types every later task sends and receives.
+- Produces: the types every later task sends and receives, and the single
+  parser Tasks 7 and 9 share with the terminal.
 
 Define, with `#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]` and
 `#[serde(tag = "type", rename_all = "snake_case")]` on the two enums:
@@ -104,7 +125,7 @@ pub struct AgentInfo {
     pub name: String,                  // display name
     pub model: String,                 // "deepseek:deepseek-chat"
     pub cwd: String,
-    pub skills: Vec<String>,           // so the browser can offer /<skill>
+    pub skills: Vec<String>,           // so the browser can list /<skill>
 }
 
 pub enum FromAgent {                   // Jarvo -> server
@@ -136,11 +157,12 @@ pub enum ToBrowser {                   // server -> browser
     Left { id: AgentId },
     Turn { id: AgentId, turn: TurnId, event: TurnEvent },
     Tail { id: AgentId, events: Vec<(TurnId, TurnEvent)> },
+    Refused { id: AgentId, reason: String },
 }
 
 pub enum FromBrowser {                 // browser -> server
     Select { id: AgentId },
-    Send { id: AgentId, text: String },
+    Send { id: AgentId, text: String },   // raw, exactly as typed
     Spawn { cwd: String, name: Option<String> },
 }
 ```
@@ -148,9 +170,55 @@ pub enum FromBrowser {                 // browser -> server
 `TurnId` exists so a later feature can persist and replay a conversation; keep
 it on every turn event even though nothing stores it yet.
 
-- [ ] **Step 1: Write the failing test**
+Two rulings the protocol needs, so that Tasks 7, 8 and 9 agree:
+
+- **`TurnId` is minted by the Jarvo-side client (Task 8), never by the
+  server.** It starts at 1 and increments when the client sees
+  `AgentEvent::Started`; every event up to the next `Started` carries that id.
+  An event that belongs to no turn — a startup `Notice`, or a `Queued` while
+  another turn runs — carries the id of the turn in progress, and `TurnId(0)`
+  before the first one. It is a stable handle for the session sharing the spec
+  defers, nothing more.
+- **`Accepted` never crosses the wire.** That variant (Task 4) exists so the
+  *terminal* shows the question above the answer when a prompt came from the
+  room; the room drew that line itself when it sent it. The client drops it,
+  which is why `TurnEvent` has `Queued` and no `Accepted`.
+
+**The parser.** The spec's decision 9 — the room sends prompts, `/json` and
+skills, and not the destructive commands — is only true by construction if
+there is exactly one parser. Today `submit` parses inline
+(`src/tui/mod.rs:253-279`) and copying that shape into the server would be two
+parsers drifting apart. Lift it:
 
 ```rust
+// src/command.rs
+pub enum Input {
+    Prompt(String),
+    Structured(String),                        // /json <prompt>
+    Skill { name: String, request: String },   // /<skill> <request>
+    JsonWithoutAPrompt,                        // a bare /json
+    Clear,                                     // /clear
+    Quit,                                      // /exit, /quit, /bye
+}
+
+pub fn parse(text: &str, skills: &[String]) -> Input;
+```
+
+`parse` is pure: no `App`, no I/O, no transcript pushes. `submit` keeps the
+lines it writes and the quit handling it has today and takes its decision from
+`Input` instead of from `strip_prefix`; the quit check stays exactly where it
+is, before the busy guard and before the input is consumed.
+
+Task 7's server calls this same `parse`. `Input::Clear` and `Input::Quit`
+arriving from the room are answered with `ToBrowser::Refused` and go no
+further: nobody wipes a conversation or closes a Jarvo somebody else is
+sitting in front of. There is deliberately no `ToAgent` variant for either, so
+the refusal sits at the edge of a protocol that could not carry them anyway.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// src/office/protocol.rs
 #[test]
 fn a_turn_event_round_trips_through_json() {
     let event = FromAgent::Turn {
@@ -168,75 +236,142 @@ fn an_unknown_message_type_is_an_error_not_a_panic() {
     let result: Result<ToAgent, _> = serde_json::from_str(r#"{"type":"nope"}"#);
     assert!(result.is_err());
 }
+
+// src/command.rs
+#[test]
+fn the_parser_tells_the_shapes_apart() {
+    let skills = vec!["teach".to_string()];
+    assert!(matches!(parse("hello", &skills), Input::Prompt(_)));
+    assert!(matches!(parse("/json do it", &skills), Input::Structured(p) if p == "do it"));
+    assert!(matches!(parse("/json", &skills), Input::JsonWithoutAPrompt));
+    assert!(matches!(parse("/teach rust", &skills), Input::Skill { name, .. } if name == "teach"));
+    assert!(matches!(parse("/clear", &skills), Input::Clear));
+    assert!(matches!(parse("/bye", &skills), Input::Quit));
+    assert!(
+        matches!(parse("/nope", &skills), Input::Prompt(_)),
+        "an unknown slash command is ordinary text, as it is today"
+    );
+}
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [ ] **Step 2: Run them and watch them fail**
 
-Run: `cargo test office::protocol`
-Expected: FAIL — the module does not exist.
+Run: `cargo test office::protocol command::`
+Expected: FAIL — neither module exists.
 
-- [ ] **Step 3: Write the types above in `src/office/protocol.rs`**
+- [ ] **Step 3: Write the types in `src/office/protocol.rs`**
 
 Derive only; no methods, no logic.
 
-- [ ] **Step 4: Run the tests**
+- [ ] **Step 4: Move the parse out of `submit` into `src/command.rs`**
 
-Run: `cargo test office::protocol` — Expected: PASS.
+`submit` keeps its structure and its transcript lines; only the decision moves.
+The existing `submit` tests must keep passing unchanged — that is the proof the
+lift was behaviour-preserving.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Run the whole suite**
+
+Run: `cargo test` — Expected: PASS, including every existing `submit` test.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/office src/main.rs
-git commit -m "Give the office a wire format"
+git add src/office src/command.rs src/main.rs src/tui/mod.rs
+git commit -m "Give the office a wire format and one command parser"
 ```
 
 ---
 
-### Task 2: The `--office-dir` option
+### Task 2: The office options
 
 **Files:**
-- Modify: `src/config.rs` — add the CLI field, the `Config` field, and the line
-  in `Config::resolve`
+- Modify: `src/config.rs` — four new `Cli` fields, two new `Config` fields, and
+  the lines in `Config::resolve`
 - Test: `src/config.rs`'s existing `mod tests`
 
 **Interfaces:**
-- Produces: `Config::office_dir: Option<PathBuf>`; `None` means the office is
-  off for this Jarvo.
+- Produces, on `Config` (the resolved configuration the TUI runs on):
 
-Follow the existing `shell_dir` option exactly: same `value_parser = any_path`,
-same `non_empty_path` treatment in `resolve`, environment variable
+```rust
+pub office_dir: Option<PathBuf>,   // None means the office is off
+pub office_name: Option<String>,   // None means "name me after my directory"
+```
+
+- Produces, on `Cli` only (read before `Config::resolve`, because the server
+  process needs neither a provider nor a key):
+
+```rust
+pub office_bind: String,              // default "127.0.0.1:0"
+pub serve_office: Option<PathBuf>,    // hidden; set means "be the server"
+```
+
+`--office-dir` follows the existing `shell_dir` exactly: `value_parser =
+any_path`, `non_empty_path` in `resolve`, environment variable
 `RIGAGENT_OFFICE_DIR`. Read `skills_dir` and `shell_dir` in that file and copy
-their shape.
+their shape. The default when the variable is absent is `None` — **off**; the
+spec is explicit that a bare `rigagent` must not start listening on a port.
 
-The default when the variable is absent is `None` — **off**. The spec is
-explicit: a bare `rigagent` must not start listening on a port.
+`--office-name` (env `RIGAGENT_OFFICE_NAME`) is a `String`, so the empty-path
+trap does not apply; an empty value resolves to `None`. Task 8 uses it, Task 10
+passes it to a Jarvo started from the room.
 
-- [ ] **Step 1: Write the failing test**
+`--office-bind` (env `RIGAGENT_OFFICE_BIND`, default `"127.0.0.1:0"`) is the
+spec's deliberate flag: port 0 picks a free port, and reaching the office from
+another machine means setting this to something else on purpose. It stays a
+`String` and is parsed into a `SocketAddr` by the server in Task 7, so a typo
+is the server's error message rather than a refusal to start the TUI. A blank
+value — `RIGAGENT_OFFICE_BIND=` in `.env` — means the default, not an empty
+address.
+
+`--serve-office <dir>` is `hide = true`: it is how one binary is also the
+server, not a thing a person types. It is a `PathBuf`, so it takes
+`value_parser = any_path` like every other path option here, even though
+nothing sets it from `.env`. **`src/main.rs` branches on it after
+parsing `Cli` and before `Config::resolve`**, because the server needs no
+provider, no model and no API key, and `resolve` fails without them. Clap
+stays in `config.rs`, as `AGENTS.md` requires; `main.rs` holds only the branch.
+
+- [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
 fn a_blank_office_dir_means_off_rather_than_a_startup_failure() {
     let cli = Cli::try_parse_from(["rigagent", "--office-dir", ""])
         .expect("an empty path must parse, as it does for --shell-dir");
-    let config = Config::resolve(cli).expect("resolve");
-    assert!(config.office_dir.is_none());
+    assert_eq!(non_empty_path(cli.office_dir), None);
+}
+
+#[test]
+fn the_office_binds_to_localhost_on_a_free_port_unless_told_otherwise() {
+    let cli = Cli::try_parse_from(["rigagent"]).expect("parse");
+    assert_eq!(cli.office_bind, "127.0.0.1:0");
+}
+
+#[test]
+fn serving_the_office_is_a_separate_mode() {
+    let cli = Cli::try_parse_from(["rigagent", "--serve-office", "/tmp/office"])
+        .expect("parse");
+    assert_eq!(cli.serve_office.as_deref(), Some(Path::new("/tmp/office")));
 }
 ```
 
-If `Config::resolve` in the test environment needs a provider key, follow
-whatever the neighbouring tests in that file already do.
+Follow whatever the neighbouring tests in that file already do about a provider
+key; the first test deliberately checks `non_empty_path` directly, the way
+`a_blank_shell_directory_means_off` does, so it needs no resolved `Config`.
 
-- [ ] **Step 2: Run it and watch it fail** — `cargo test config::`
+- [ ] **Step 2: Run them and watch them fail** — `cargo test config::`
 
-- [ ] **Step 3: Add the option**
+- [ ] **Step 3: Add the four options and the two `Config` fields**
 
-`--office-dir`, env `RIGAGENT_OFFICE_DIR`, help text: "Directory holding the
-office registration; unset means no office".
+Help text: `--office-dir` "Directory holding the office registration; unset
+means no office", `--office-name` "This agent's name in the office; defaults to
+the directory's name", `--office-bind` "Address the office server listens on",
+`--serve-office` hidden.
 
 - [ ] **Step 4: Run the tests** — `cargo test config::` — Expected: PASS.
 
-- [ ] **Step 5: Document it** in the `README.md` options and environment
-  tables, beside `--shell-dir`.
+- [ ] **Step 5: Document them** in the `README.md` options and environment
+  tables, beside `--shell-dir`. `--serve-office` is internal and stays out.
 
 - [ ] **Step 6: Commit**
 
@@ -305,7 +440,10 @@ async fn a_full_extra_channel_never_blocks_the_primary() {
     }
     drop(extra_rx);
     sink.send(AgentEvent::Started).await.expect("a dead office is not an error");
-    assert_eq!(rx.recv().await.is_some(), true);
+    assert!(
+        rx.recv().await.is_some(),
+        "the TUI keeps receiving after the office is gone"
+    );
 }
 ```
 
@@ -332,7 +470,9 @@ git commit -m "Let a second listener watch the agent without slowing it"
 
 **Files:**
 - Modify: `src/agent.rs` — `AgentCommand`, `AgentEvent`, `AgentTask::run`
-- Modify: `src/tui/mod.rs:241-244` (the busy rejection) and `submit`
+- Modify: `src/tui/mod.rs` — the busy rejection in `submit` (it is at
+  `241-244` today; Task 1 moves the parse out of that function, so find the
+  `app.busy` guard rather than trusting the line number)
 - Modify: `src/tui/app.rs` — `apply_event`
 - Test: all three files' `mod tests`
 
@@ -358,9 +498,9 @@ Behaviour:
 - A command with `Origin::Office` emits `Accepted { text }` as its turn starts,
   so the terminal shows the question above the answer. A command with
   `Origin::Tui` does not: `submit` already pushed that line locally.
-- `submit` no longer refuses when `app.busy`. Delete the rejection at
-  `src/tui/mod.rs:241-244`; the queue is the answer now. Quit commands keep
-  their place *before* that code — they must still work mid-turn.
+- `submit` no longer refuses when `app.busy`. Delete that guard; the queue is
+  the answer now. Quit commands keep their place *before* it — they must still
+  work mid-turn.
 - `App::apply_event` pushes `Role::System` `"queued: <text>"` for `Queued`, and
   `Role::User` `text` for `Accepted`.
 
@@ -440,12 +580,25 @@ pub fn publish(dir: &Path, registration: &Registration) -> std::io::Result<()>;
 
 `claim` is won with `OpenOptions::new().create_new(true).open(dir.join("office.lock"))`
 — atomic on every platform that matters, and the only correct way to settle the
-race between two Jarvos starting in the same second. If the lock exists but
-`office.json` names a pid that is no longer alive, remove both and retry once;
-a crashed Jarvo must not lock the office out forever. Check liveness with
-`kill(pid, 0)` semantics (`libc::kill` or an equivalent already in the tree) —
-if that cannot be done portably, treat a registration older than 60 seconds
-with no reachable port as stale.
+race between two Jarvos starting in the same second.
+
+**The winner writes its own pid into the lock file** before it returns, because
+the lock can outlive it: a Jarvo that wins and then dies before the server
+registers leaves a lock with no `office.json` beside it, and a plan that only
+expires a dead pid *in the registration* would lock the office out forever.
+So `claim` treats a lock as stale when any of these holds, removes it together
+with any `office.json`, and retries exactly once:
+
+- the lock names a pid that is no longer alive;
+- the lock names no readable pid and is older than 60 seconds;
+- there is no `office.json` and the lock is older than 60 seconds (the winner
+  died mid-startup).
+
+Liveness is `kill(pid, 0)` semantics. There is no `libc` in this tree and this
+plan does not add one, so use `kill -0` through `std::process::Command`, or
+`/proc`-free platform-agnostic age as the fallback above; either way an
+unreadable answer counts as "not alive" only once the 60 seconds have passed,
+so a slow start is never mistaken for a crash.
 
 Never log the `token` field.
 
@@ -471,7 +624,19 @@ fn a_registration_round_trips() {
 fn a_missing_directory_is_not_an_error() {
     assert!(find(Path::new("/nonexistent/rigagent-office")).is_none());
 }
+
+#[test]
+fn a_lock_whose_winner_died_before_registering_is_reclaimed() {
+    let dir = tempdir();
+    std::fs::write(dir.join("office.lock"), "999999").expect("a dead pid");
+    assert!(
+        claim(&dir).expect("reclaim"),
+        "a lock with no registration and a dead owner must not hold the office"
+    );
+}
 ```
+
+`tempdir` is `tempfile::tempdir()`, kept in `[dev-dependencies]`.
 
 - [ ] **Step 2: Run them and watch them fail** — `cargo test office::registry`
 
@@ -553,14 +718,20 @@ git commit -m "Sign and check the office's tokens"
 
 **Files:**
 - Create: `src/office/server.rs`
-- Modify: `Cargo.toml` (`cargo add axum tower-http --features ...` as needed)
-- Modify: `src/main.rs` — a hidden `--serve-office <dir>` argument that runs the
-  server instead of the TUI, so one binary does both
+- Modify: `Cargo.toml` — `cargo add axum`, plus `tower` with its `util` feature
+  as a dev-dependency. Not `tower-http`: the static files are `include_str!`
+  in handlers.
+- Modify: `src/main.rs` — the branch on `Cli::serve_office` from Task 2, taken
+  **before `Config::resolve`**, so one binary is also the server and the server
+  starts without a provider or an API key
 - Test: in `src/office/server.rs`
 
 **Interfaces:**
 - Consumes: `protocol`, `auth`, `registry`.
-- Produces: `pub async fn serve(dir: &Path, bind: SocketAddr) -> Result<()>`.
+- Produces: `pub async fn serve(dir: &Path, bind: &str) -> Result<()>`. `bind`
+  is `Cli::office_bind` verbatim; `serve` parses it into a `SocketAddr` itself,
+  so a typo is this process's error message rather than a TUI that refuses to
+  start.
 
 Routes:
 
@@ -582,16 +753,32 @@ WebSocket routes as a `?token=` query parameter (browsers cannot set headers on
 a WebSocket handshake). **No cookies anywhere.** This is the spec's decision;
 do not reach for a cookie because it is easier.
 
-Default bind is `127.0.0.1:0` (a free port). Binding anywhere else is a flag,
-and the README has to say what that exposes.
+The default `127.0.0.1:0` comes from `--office-bind` (Task 2), so reaching the
+office from another machine is a deliberate flag and the README has to say what
+that exposes. Once the listener is up, `serve` reads the real port back from it
+(port 0 means the kernel chose it), issues a browser token, writes the
+registration with `registry::publish`, and prints the URL carrying that token.
+This is the one place in this codebase allowed to print, because the server is
+its own process — and the URL is printed, never logged, because it contains a
+token.
 
-When an agent's socket closes, the server keeps its `AgentInfo` and tail for 60
-seconds and tells the browsers `Left`, so a disappearing agent greys out before
-it drops rather than vanishing mid-sentence. After that it is forgotten.
+When an agent's socket closes the server sends `ToBrowser::Left { id }` once,
+keeps that agent's `AgentInfo` and tail for 60 seconds so a browser arriving
+late still sees its last words, and then forgets it. **The grey-out and the
+removal are the browser's own timer, not a second frame** (Task 9): a browser
+that connects during those 60 seconds never saw the `Left` that started the
+clock, so a "now really gone" message would reach nobody who needed it. A
+`Joined` with the same id cancels the timer.
 
-Note what the protocol cannot express, and keep it that way: there is no
-`ToAgent` variant that clears a conversation or quits an agent. `/clear` and the
-quit commands do not cross the network, by construction rather than by a check.
+`FromBrowser::Send` carries raw text, exactly as typed. The server hands it to
+`command::parse` from Task 1 — the shared parser, not a copy — and maps
+`Input::Structured` to `ToAgent::Structured`, `Input::Skill` to
+`ToAgent::Skill`, `Input::Prompt` to `ToAgent::Prompt`, and
+`Input::JsonWithoutAPrompt`, `Input::Clear` and `Input::Quit` to
+`ToBrowser::Refused`. Note what the protocol cannot express, and keep it that
+way: there is no `ToAgent` variant that clears a conversation or quits an
+agent. `/clear` and the quit commands do not cross the network by
+construction, not by a check.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -612,6 +799,13 @@ async fn the_roster_is_served_with_a_good_token() { /* 200, empty array */ }
 #[tokio::test]
 async fn the_tail_is_bounded() {
     // push 300 events for one agent; assert the stored tail is 200
+}
+
+#[tokio::test]
+async fn a_clear_from_the_room_is_refused_and_never_reaches_the_agent() {
+    // feed FromBrowser::Send { text: "/clear" } to the handler for a connected
+    // fake agent; assert a ToBrowser::Refused goes back and that the agent's
+    // ToAgent channel is still empty. Same for "/quit".
 }
 ```
 
@@ -648,21 +842,33 @@ git commit -m "Open the office"
 /// the conversation. Any failure is a note, never an error.
 pub async fn join(
     dir: &Path,
+    bind: &str,              // Cli::office_bind, handed on to a server we spawn
     info: AgentInfo,
     handle: AgentHandle,
 ) -> (Option<mpsc::Sender<AgentEvent>>, String);
 ```
 
-The `AgentInfo` this Jarvo announces takes its `name` from `--office-name` if
-given, otherwise the basename of the working directory; if the server already
-holds that name, it appends `-2`, `-3` and so on. `id` is fresh per process:
-a restarted Jarvo is a new character, by decision in the spec.
+`agent::start` builds the `AgentInfo`: `name` is `config.office_name` (Task 2)
+when it is set and the basename of the working directory otherwise, and the
+*server* appends `-2`, `-3` and so on when that name is taken — de-duplication
+belongs to the one process that can see every name. `id` is fresh per process:
+a restarted Jarvo is a new character, by decision in the spec. `skills` is the
+list `Started::skills` already carries.
 
 `join` does, in order: `registry::find`; if nothing, `registry::claim`; if won,
-spawn `std::env::current_exe()` with `--serve-office <dir>` detached and wait
-(polling `find`, up to 5 seconds) for the registration; connect the WebSocket;
-send `Hello`; then run two loops — `AgentEvent` → `FromAgent::Turn` out, and
-`ToAgent` → `AgentCommand` (with `Origin::Office`) in through `handle`.
+spawn `std::env::current_exe()` with
+`--serve-office <dir> --office-bind <bind>` and wait (polling `find`, up to 5
+seconds) for the registration; connect the WebSocket; send `Hello`; then run
+two loops — `AgentEvent` → `FromAgent::Turn` out, and `ToAgent` →
+`AgentCommand` (with `Origin::Office`) in through `handle`.
+
+**The spawn sets `Stdio::null()` on stdin, stdout and stderr.** A child
+inherits them by default, so the server's startup line — or its panic — would
+print straight onto the running TUI, which is the spec's sharpest anti-goal and
+exactly why `src/mcp.rs` pipes a server's stderr into `tracing` instead. The
+URL the server prints therefore reaches nobody; `join` reads the port and token
+back out of the registration and puts the address in its note, so it arrives in
+the conversation the way the MCP notes do.
 
 **If anything fails, return `(None, note)`.** Jarvo must start and work exactly
 as it does today when there is no office. This is Review Focus 2 and the spec's
@@ -672,9 +878,18 @@ sharpest anti-goal.
 
 ```rust
 #[tokio::test]
-async fn an_unreachable_office_is_a_note_not_a_failure() {
-    let dir = tempdir();                       // empty: no registration, no binary to spawn
-    let (sink, note) = join(&dir, test_info(), test_handle()).await;
+async fn an_office_that_cannot_be_claimed_is_a_note_not_a_failure() {
+    // A file where the directory should be: `find` finds nothing, `claim`
+    // cannot create the lock inside it, and `join` returns before it would
+    // spawn anything. Do NOT point this test at an empty temporary directory:
+    // `claim` would win, and under `cargo test` `current_exe()` is the test
+    // binary — the test would spawn a copy of itself, wait five seconds, and
+    // leave the process behind.
+    let dir = tempdir();
+    let path = dir.join("not-a-directory");
+    std::fs::write(&path, b"").expect("write");
+
+    let (sink, note) = join(&path, "127.0.0.1:0", test_info(), test_handle()).await;
     assert!(sink.is_none());
     assert!(note.to_lowercase().contains("office"), "the note names the problem: {note}");
 }
@@ -727,14 +942,16 @@ token comes from the URL's `?token=` on first load and is kept in
 `localStorage`; **never in a cookie.** Deltas arrive continuously, so append to
 a text node rather than re-rendering the panel.
 
-The command box understands the same `/` commands the terminal does, minus the
-destructive ones: `/json <prompt>` sends `FromBrowser::Send` whose text the
-server turns into `ToAgent::Structured`, `/<skill> <request>` into
-`ToAgent::Skill`, and anything else into `ToAgent::Prompt`. The skill names come
-from the roster — add `skills: Vec<String>` to `AgentInfo` in Task 1's types and
-fill it in Task 8 from `Started::skills`. `/clear`, `/exit`, `/quit` and `/bye`
-are typed into the box as ordinary text and must not be special-cased into
-anything: the protocol has no variant for them.
+**The box parses nothing.** It sends what was typed, verbatim, as
+`FromBrowser::Send { id, text }`, and the server parses it with the one parser
+from Task 1 — so the room and the terminal can never come to disagree about
+what `/json` means. The panel lists the roster's `skills` so a person can see
+which `/<skill>` commands exist, and shows a `ToBrowser::Refused` as a line in
+the transcript, which is what `/clear`, `/exit`, `/quit` and `/bye` get.
+
+An agent that disappears is greyed when `ToBrowser::Left` arrives and removed
+by a 60-second timer in the page, cancelled if a `Joined` with the same id
+arrives first. The server sends no second frame; Task 7 says why.
 
 Pixel art is explicitly *not* part of this task: a coloured box with a name and
 a dot is the deliverable. The visuals are a later plan.
@@ -790,7 +1007,10 @@ pub fn tmux_command(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> Vec<Strin
 pub fn spawn(exe: &Path, dir: &Path, cwd: &Path, name: &str) -> std::io::Result<()>;
 ```
 
-`tmux new-session -d -s jarvo-<name> -c <cwd> <exe> --office-dir <dir>`.
+`tmux new-session -d -s jarvo-<name> -c <cwd> <exe> --office-dir <dir>
+--office-name <name>`. The name has to be passed: without it the new Jarvo
+names itself after its directory and the name chosen in the room is silently
+dropped.
 
 **The spawned Jarvo gets no shell.** Do not pass `--shell-dir`. Someone who can
 reach the office can already drive every agent in it; letting the room mint new
@@ -814,6 +1034,10 @@ fn the_spawn_command_names_the_session_and_never_enables_the_shell() {
     assert_eq!(argv[0], "tmux");
     assert!(argv.windows(2).any(|w| w[0] == "-s" && w[1] == "jarvo-api"));
     assert!(argv.iter().any(|a| a == "--office-dir"));
+    assert!(
+        argv.windows(2).any(|w| w[0] == "--office-name" && w[1] == "api"),
+        "the name chosen in the room reaches the new Jarvo"
+    );
     assert!(!argv.iter().any(|a| a == "--shell-dir"), "no shell from the room");
 }
 ```
@@ -845,7 +1069,9 @@ git commit -m "Hire a new agent from the room"
 
 The README section states, plainly:
 
-- What the office is and how to turn it on (`--office-dir` / `RIGAGENT_OFFICE_DIR`).
+- What the office is and how to turn it on (`--office-dir` /
+  `RIGAGENT_OFFICE_DIR`), what `--office-name` is for, and that `--office-bind`
+  is the single flag that makes the office reachable from another machine.
 - That the first Jarvo with it enabled starts the server, and the others join.
 - That the server binds `127.0.0.1` by default, and that **exposing the port
   sends the bearer token and the whole conversation in cleartext** — put it
